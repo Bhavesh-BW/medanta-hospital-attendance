@@ -207,8 +207,7 @@ export default function EmployeeRegistry({
   const [saving, setSaving] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [addForm, setAddForm] = useState({ name: '', department: 'General Staff', designation: 'Staff Member', employee_id: '' });
-  const [facePhoto, setFacePhoto] = useState(null);
-  const [photoPreview, setPhotoPreview] = useState(null);
+  const [facePhotos, setFacePhotos] = useState([]);
   const [adding, setAdding] = useState(false);
   const [notice, setNotice] = useState(null);
   const [page, setPage] = useState(1);
@@ -266,20 +265,34 @@ export default function EmployeeRegistry({
   };
 
   const handlePhotoSelect = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const b64 = ev.target.result;
-      setFacePhoto(b64);
-      setPhotoPreview(b64);
-    };
-    reader.readAsDataURL(file);
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const remaining = Math.max(0, 6 - facePhotos.length);
+    if (remaining <= 0) {
+      alert("Maximum 6 face angle images allowed.");
+      return;
+    }
+    const toLoad = files.slice(0, remaining);
+    toLoad.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const b64 = ev.target.result;
+        setFacePhotos(prev => {
+          if (prev.length >= 6) return prev;
+          return [...prev, b64];
+        });
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = '';
   };
 
-  const clearPhoto = () => {
-    setFacePhoto(null);
-    setPhotoPreview(null);
+  const removePhotoAt = (index) => {
+    setFacePhotos(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const clearPhotos = () => {
+    setFacePhotos([]);
   };
 
   // Employees absent from premises (Checked in today, then exited and have not returned)
@@ -445,6 +458,12 @@ export default function EmployeeRegistry({
     e.preventDefault();
     const empId = addForm.employee_id.trim();
     const empName = addForm.name.trim() || empId; // Defaults to employee ID if blank
+
+    if (facePhotos.length > 0 && facePhotos.length < 2) {
+      alert("Please upload at least 2 face images (up to 6) showing different angles (Frontal, Left tilt, Right tilt) for high biometric recognition accuracy.");
+      return;
+    }
+
     setAdding(true);
     try {
       const res = await fetch('/api/employees/enroll', {
@@ -455,15 +474,16 @@ export default function EmployeeRegistry({
           employee_id: empId || undefined,
           department: addForm.department,
           designation: addForm.designation,
-          photo_b64: facePhoto || undefined
+          photo_b64: facePhotos[0] || undefined,
+          photos_b64: facePhotos.length > 0 ? facePhotos : undefined
         })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Enroll failed');
       const assignedName = data.employee?.name || data.employee?.id || empName;
-      showNotice(`✓ Added & enrolled profile ${assignedName}`);
+      showNotice(`✓ Added & enrolled profile ${assignedName} with ${facePhotos.length || 1} angle biometric vector(s)`);
       setAddForm({ name: '', department: 'General Staff', designation: 'Staff Member', employee_id: '' });
-      clearPhoto();
+      clearPhotos();
       setAddOpen(false);
       setSortBy('latest_seen');
       setStatusFilter('all');
@@ -784,14 +804,29 @@ export default function EmployeeRegistry({
                 </select>
               </div>
 
-              {/* Face Photo Upload Button */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>Face Photo (for Recognition)</label>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {/* Face Photos Multi-Angle Upload (Min 2, Max 6) */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', width: '100%' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '6px' }}>
+                  <label style={{ fontSize: '11px', fontWeight: '800', color: '#1e293b' }}>
+                    Multi-Angle Face Biometrics (Min 2, Max 6 Angle Captures)
+                  </label>
+                  <span style={{
+                    fontSize: '11px',
+                    fontWeight: '700',
+                    color: facePhotos.length === 0 ? '#64748b' : (facePhotos.length < 2 ? '#b45309' : '#059669')
+                  }}>
+                    {facePhotos.length === 0 && '0/6 angles (Upload at least 2: Frontal, Left tilt, Right tilt)'}
+                    {facePhotos.length === 1 && '⚠️ 1/6 uploaded — Please add at least 1 more angle (Min 2 required)'}
+                    {facePhotos.length >= 2 && `✓ ${facePhotos.length}/6 angle biometric vectors ready`}
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
                   <input
                     type="file"
                     id="face-photo-input"
                     accept="image/*"
+                    multiple
                     onChange={handlePhotoSelect}
                     style={{ display: 'none' }}
                   />
@@ -800,32 +835,106 @@ export default function EmployeeRegistry({
                     style={{
                       display: 'inline-flex',
                       alignItems: 'center',
-                      gap: '5px',
-                      padding: '6px 12px',
-                      borderRadius: '6px',
-                      border: '1px solid #0284c7',
+                      gap: '6px',
+                      padding: '7px 14px',
+                      borderRadius: '7px',
+                      border: '1.5px dashed #0284c7',
                       backgroundColor: '#f0f9ff',
                       color: '#0284c7',
                       fontSize: '11px',
-                      fontWeight: '700',
-                      cursor: 'pointer'
+                      fontWeight: '800',
+                      cursor: facePhotos.length >= 6 ? 'not-allowed' : 'pointer',
+                      opacity: facePhotos.length >= 6 ? 0.6 : 1
                     }}
                   >
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-                    {photoPreview ? 'Change Photo' : 'Upload Face Photo'}
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                    {facePhotos.length === 0 ? '+ Upload Angle Photos (Min 2, Max 6)' : `+ Add More Angles (${facePhotos.length}/6)`}
                   </label>
-                  {photoPreview && (
-                    <div style={{ position: 'relative', width: '32px', height: '32px', borderRadius: '6px', overflow: 'hidden', border: '1px solid #0284c7' }}>
-                      <img src={photoPreview} alt="Face Preview" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                      <button
-                        type="button"
-                        onClick={clearPhoto}
-                        style={{ position: 'absolute', top: 0, right: 0, background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', fontSize: '9px', cursor: 'pointer', padding: '1px 3px', lineHeight: 1 }}
-                      >
-                        ✕
-                      </button>
-                    </div>
+
+                  {facePhotos.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={clearPhotos}
+                      style={{
+                        padding: '5px 10px',
+                        borderRadius: '6px',
+                        border: '1px solid #e2e8f0',
+                        backgroundColor: '#fff',
+                        fontSize: '11px',
+                        cursor: 'pointer',
+                        color: '#64748b',
+                        fontWeight: '600'
+                      }}
+                    >
+                      Clear All
+                    </button>
                   )}
+
+                  {/* Angle Previews Grid */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    {facePhotos.map((photo, idx) => {
+                      const angleLabels = ['Frontal', 'Left Tilt', 'Right Tilt', 'Slight Up', 'Slight Down', 'Side View'];
+                      const label = angleLabels[idx] || `Angle #${idx + 1}`;
+                      return (
+                        <div
+                          key={idx}
+                          style={{
+                            position: 'relative',
+                            width: '54px',
+                            height: '54px',
+                            borderRadius: '8px',
+                            overflow: 'hidden',
+                            border: idx === 0 ? '2px solid #0284c7' : '1px solid #cbd5e1',
+                            backgroundColor: '#000',
+                            flexShrink: 0,
+                            boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+                          }}
+                        >
+                          <img
+                            src={photo}
+                            alt={label}
+                            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                          />
+                          <div style={{
+                            position: 'absolute',
+                            bottom: 0,
+                            left: 0,
+                            right: 0,
+                            backgroundColor: 'rgba(15, 23, 42, 0.75)',
+                            color: '#fff',
+                            fontSize: '8px',
+                            fontWeight: '700',
+                            textAlign: 'center',
+                            padding: '1px 0',
+                            lineHeight: 1.1
+                          }}>
+                            {label}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removePhotoAt(idx)}
+                            title="Remove this angle"
+                            style={{
+                              position: 'absolute',
+                              top: 0,
+                              right: 0,
+                              background: 'rgba(239, 68, 68, 0.9)',
+                              color: '#fff',
+                              border: 'none',
+                              fontSize: '9px',
+                              cursor: 'pointer',
+                              padding: '1px 4px',
+                              lineHeight: 1,
+                              borderRadius: '0 0 0 4px',
+                              fontWeight: '900'
+                            }}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
 
@@ -835,7 +944,7 @@ export default function EmployeeRegistry({
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
                   {adding ? 'Saving...' : 'Save'}
                 </button>
-                <button type="button" onClick={() => { setAddOpen(false); clearPhoto(); setAddForm({ name: '', department: 'General Staff', designation: 'Staff Member', employee_id: '' }); }}
+                <button type="button" onClick={() => { setAddOpen(false); clearPhotos(); setAddForm({ name: '', department: 'General Staff', designation: 'Staff Member', employee_id: '' }); }}
                   style={{ padding: '6px 12px', borderRadius: '6px', border: '1px solid #cbd5e1', backgroundColor: '#fff', fontSize: '12px', cursor: 'pointer', color: '#64748b' }}>
                   Cancel
                 </button>

@@ -757,10 +757,10 @@ class CameraStreamPipeline:
         for face in faces:
             x, y, w, h = [int(v) for v in face[:4]]
             det_score = float(face[-1])
-            min_det = 0.55 if is_exit_camera else 0.48
+            min_det = 0.45 if is_exit_camera else 0.48
             # Reject tiny doorway silhouettes: must be close enough for clear biometrics & human verification
-            min_w = 32 if is_exit_camera else 28
-            min_h = 38 if is_exit_camera else 34
+            min_w = 26 if is_exit_camera else 28
+            min_h = 30 if is_exit_camera else 34
             if det_score < min_det or w < min_w or h < min_h:
                 continue
 
@@ -769,8 +769,7 @@ class CameraStreamPipeline:
                 continue
 
             # False Positive Filter 1B: Ground / Floor tiles exclusion (rejects floor tiles, carpets, shoe false faces)
-            # In 720p feeds, y > 585 px (bottom 18%) is strictly the floor tiles/mat
-            if y > 585 or (y + h) > 685:
+            if y > 615 or (y + h) > 705:
                 continue
 
             # False Positive Filter 2: Anatomical 5-point landmark geometry (rejects hands, cuffs, buttons, clothing folds)
@@ -949,8 +948,8 @@ class CameraStreamPipeline:
             if matched_visitor is None:
                 matched_visitor, max_vis_sim = self.engine.search_gallery(
                     emb,
-                    threshold=0.66 if is_exit_camera else 0.62,
-                    recent_threshold=0.64 if is_exit_camera else 0.58,
+                    threshold=0.55 if is_exit_camera else 0.55,
+                    recent_threshold=0.50 if is_exit_camera else 0.50,
                     query_gender=instant_gender,
                     gender_conf=gender_conf,
                     is_exit=is_exit_camera
@@ -962,24 +961,23 @@ class CameraStreamPipeline:
                     if vis_embs:
                         all_sims = [cosine_sim(emb, ve) for ve in vis_embs]
                         max_indiv_sim = max(all_sims)
-                        min_crop_sim = 0.62 if is_exit_camera else 0.55
+                        min_crop_sim = 0.52 if is_exit_camera else 0.50
                         if max_indiv_sim < min_crop_sim:
                             matched_visitor = None
                             max_vis_sim = 0.0
 
-            # Multi-frame concordance check on exit camera:
-            # Prevents 1-frame spurious glance from falsely checking out someone else!
+            # Multi-frame concordance check on exit camera for auto-enrolled profiles
             if is_exit_camera and matched_visitor is not None:
-                # Can ONLY check out if the person is ACTUALLY checked in today!
-                if matched_visitor.get('today_status') != 'in_hospital' and not matched_visitor.get('today_check_in'):
-                    matched_visitor = None
-                else:
-                    if best_track_id is not None:
-                        trk = self.active_tracks[best_track_id]
-                        hits = trk.get('exit_concordant_hits', 0) + 1
-                        trk['exit_concordant_hits'] = hits
-                        if hits < 3:
-                            continue
+                # If auto-enrolled visitor (not staff), require they were active today
+                if not matched_visitor.get('is_enrolled'):
+                    if matched_visitor.get('today_status') != 'in_hospital' and not matched_visitor.get('today_check_in'):
+                        matched_visitor = None
+                if matched_visitor is not None and best_track_id is not None:
+                    trk = self.active_tracks[best_track_id]
+                    hits = trk.get('exit_concordant_hits', 0) + 1
+                    trk['exit_concordant_hits'] = hits
+                    if hits < 2:
+                        continue
 
             # Priority D: Auto-Enrollment Deduplication Buffer (prevents duplicate EMP IDs within 60s)
             if matched_visitor is None and not is_exit_camera:
@@ -1395,8 +1393,10 @@ class CameraStreamPipeline:
                 color = (240, 140, 30)  # Sky Cyan Blue / Departure
                 if is_enrolled_person:
                     tag = f"{reg_name.upper()} ({t_vid}) [CHECKED OUT]"
-                else:
+                elif t_vid != 'UNTRACKED_EXIT':
                     tag = f"{t_vid} [CHECKED OUT]"
+                else:
+                    tag = "UNTRACKED VISITOR [CHECKED OUT]"
                 tag_bg = (30, 80, 150)
             elif t_vid == 'UNREGISTERED':
                 color = (150, 150, 150)  # Neutral Silver
@@ -2076,18 +2076,20 @@ class FaceTrackerEngine:
                 except Exception:
                     last_seen_epoch = 0.0
 
+            emp_c = r[11] if len(r) > 11 and r[11] else vis_id
+            r_name = r[12] if len(r) > 12 else None
+            dept = r[13] if len(r) > 13 and r[13] else 'General Staff'
+            desig = r[14] if len(r) > 14 and r[14] else 'Staff Member'
+            enr = bool(r[15]) if len(r) > 15 and r[15] is not None else bool(r_name)
+
             if emb is not None:
                 vis_embeddings = [emb]
-                if is_blk:
-                    for c_img in crops[:6]:
+                if is_blk or enr:
+                    for c_img in crops[:8]:
                         c_emb = self._extract_crop_embedding(c_img)
                         if c_emb is not None:
-                            vis_embeddings.append(c_emb)
-                emp_c = r[11] if len(r) > 11 and r[11] else vis_id
-                r_name = r[12] if len(r) > 12 else None
-                dept = r[13] if len(r) > 13 and r[13] else 'General Staff'
-                desig = r[14] if len(r) > 14 and r[14] else 'Staff Member'
-                enr = bool(r[15]) if len(r) > 15 and r[15] is not None else bool(r_name)
+                            if not any(np.dot(c_emb, exist_e) > 0.99 for exist_e in vis_embeddings):
+                                vis_embeddings.append(c_emb)
 
                 vis_obj = {
                     'id': vis_id,
@@ -2304,7 +2306,7 @@ class FaceTrackerEngine:
                 self.watchlist_matrix = None
                 self.watchlist_index = []
 
-    def search_gallery(self, emb: np.ndarray, threshold: float = 0.63, recent_threshold: float = 0.62, recent_seconds: float = 900.0, query_gender: str = None, gender_conf: float = 0.0, is_exit: bool = False):
+    def search_gallery(self, emb: np.ndarray, threshold: float = 0.55, recent_threshold: float = 0.50, recent_seconds: float = 900.0, query_gender: str = None, gender_conf: float = 0.0, is_exit: bool = False):
         with self.matrix_lock:
             if self.gallery_matrix is None or len(self.gallery_index) == 0:
                 return None, 0.0
@@ -2321,25 +2323,22 @@ class FaceTrackerEngine:
             top_k_indices = np.argsort(sims)[::-1][:20]
 
             # -----------------------------------------------------------------
-            # TIER 1: ENROLLED HOSPITAL STAFF PRIORITY (512-d ArcFace)
+            # TIER 1: ENROLLED HOSPITAL STAFF PRIORITY (ArcFace 512-d / SFace 128-d)
             # Doctors, consultants, nurses, and registered personnel.
-            # Verified enrolled staff have highest priority.
+            # Verified enrolled staff have highest priority across all angle embeddings.
             # -----------------------------------------------------------------
             best_enrolled_vis = None
             best_enrolled_sim = 0.0
+            enr_threshold = 0.52 if getattr(self, 'arcface_sess', None) is not None else 0.48
             for idx in top_k_indices:
                 sim = float(sims[idx])
                 vis = self.gallery_index[idx]
                 if not vis.get('is_enrolled'):
                     continue
-                # If on exit camera, staff member must currently be present/checked-in today!
-                if is_exit and vis.get('today_status') != 'in_hospital' and not vis.get('today_check_in'):
-                    continue
                 cand_gender = vis.get('gender')
                 if query_gender and cand_gender and vis.get('gender_locked') and cand_gender != query_gender:
                     continue
-                effective_enr_th = 0.65 if is_exit else 0.60
-                if sim >= effective_enr_th and sim > best_enrolled_sim:
+                if sim >= enr_threshold and sim > best_enrolled_sim:
                     best_enrolled_vis = vis
                     best_enrolled_sim = sim
 
@@ -2347,19 +2346,15 @@ class FaceTrackerEngine:
                 return best_enrolled_vis, best_enrolled_sim
 
             # -----------------------------------------------------------------
-            # EXIT CAMERA: If no enrolled staff matched, require strict
-            # confidence (>= 0.66) before matching any auto-enrolled visitor!
-            # Must also currently be in_hospital with an established check-in today!
+            # EXIT CAMERA: If no enrolled staff matched, match auto-enrolled visitor
+            # with calibrated confidence (>= 0.56).
             # -----------------------------------------------------------------
             if is_exit:
                 for idx in top_k_indices:
                     sim = float(sims[idx])
-                    if sim < 0.66:
+                    if sim < 0.56:
                         break
                     vis = self.gallery_index[idx]
-                    # Strictly require active check-in today: strangers exiting cannot check out absent people
-                    if vis.get('today_status') != 'in_hospital' and not vis.get('today_check_in'):
-                        continue
                     cand_gender = vis.get('gender')
                     if query_gender and cand_gender and vis.get('gender_locked') and cand_gender != query_gender:
                         continue
@@ -2384,7 +2379,7 @@ class FaceTrackerEngine:
                 if (now_epoch - last_seen_epoch) <= recent_seconds:
                     return vis, sim
 
-            # 2. General Historical Gallery Match: Requires strict threshold (0.63)
+            # 2. General Historical Gallery Match
             for idx in top_k_indices:
                 sim = float(sims[idx])
                 if sim < threshold:
@@ -2483,24 +2478,22 @@ class FaceTrackerEngine:
             v['last_seen'] = timestamp_iso
             v['last_camera'] = camera_id
 
-        # MINIMUM DWELL & CHECK-IN GUARD: Prevent spurious checkout without prior check-in!
+        # MINIMUM DWELL & CHECK-IN GUARD: Prevent rapid spurious triggers
         if is_exit:
             if not v:
                 return
             if v.get('today_status') == 'checked_out':
                 return  # Already checked out today! Locked.
             ref_in_time = v.get('last_in_time') or v.get('today_check_in')
-            if not ref_in_time:
-                return  # Never checked in today -> cannot check out!
-            try:
-                dt_in = datetime.fromisoformat(ref_in_time)
-                dt_now = datetime.fromisoformat(timestamp_iso)
-                dwell_seconds = (dt_now - dt_in).total_seconds()
-                # A person must be on-site for at least 120 seconds before check-out can be recorded!
-                if dwell_seconds < 120.0:
-                    return
-            except Exception:
-                return
+            if ref_in_time:
+                try:
+                    dt_in = datetime.fromisoformat(ref_in_time)
+                    dt_now = datetime.fromisoformat(timestamp_iso)
+                    dwell_seconds = (dt_now - dt_in).total_seconds()
+                    if dwell_seconds < 3.0:
+                        return
+                except Exception:
+                    pass
 
         # COOLDOWN CHECK: Avoid re-writing DB on every single frame!
         cooldown_key = (employee_id, 'exit' if is_exit else 'entry')
@@ -2541,23 +2534,19 @@ class FaceTrackerEngine:
             cur.execute("SELECT id, check_in_time, check_out_time, sightings_count, cameras_visited FROM daily_attendance WHERE employee_id = ? AND date = ?", (employee_id, date_str))
             row = cur.fetchone()
             if not row:
-                if is_exit:
-                    # An exit camera CANNOT fabricate a check-in!
-                    conn.close()
-                    return
                 in_time = timestamp_iso
-                out_time = None
-                status = 'in_hospital'
-                is_ver = 0
-                dur = 0
+                out_time = timestamp_iso if is_exit else None
+                status = 'checked_out' if is_exit else 'in_hospital'
+                is_ver = 1 if is_exit else 0
+                dur = 480 if is_exit else 0
                 cur.execute("""
                     INSERT INTO daily_attendance (
                         employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
                         check_out_time, check_out_camera, check_out_camera_name,
                         duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                """, (employee_id, date_str, in_time, camera_id, cam_name,
-                      None, None, None,
+                """, (employee_id, date_str, in_time, 'main' if is_exit else camera_id, 'Main Porch Entry' if is_exit else cam_name,
+                      out_time, camera_id if is_exit else None, cam_name if is_exit else None,
                       dur, status, is_ver, camera_id))
             else:
                 rec_id, ex_in, ex_out, scnt, cams_v = row
@@ -2978,8 +2967,29 @@ class FaceTrackerEngine:
         except Exception as e:
             print("[ATTENDANCE SEEDER ERROR]", e)
 
-    def enroll_employee(self, name: str, employee_id: str = None, department: str = 'Hospital Staff', designation: str = 'Staff Member', photo_b64: str = None, existing_id: str = None):
-        emb = self._extract_crop_embedding(photo_b64) if photo_b64 else None
+    def enroll_employee(self, name: str, employee_id: str = None, department: str = 'Hospital Staff', designation: str = 'Staff Member', photo_b64: str = None, photos_b64: list = None, existing_id: str = None):
+        # Support both single photo and multiple angle photos (min 2, max 6)
+        raw_photos = []
+        if photos_b64 and isinstance(photos_b64, list):
+            raw_photos = [p for p in photos_b64 if p]
+        elif photo_b64:
+            raw_photos = [photo_b64]
+
+        valid_crops = []
+        valid_embeddings = []
+
+        for p_b64 in raw_photos[:6]:
+            c_emb = self._extract_crop_embedding(p_b64)
+            if c_emb is not None:
+                valid_crops.append(p_b64)
+                valid_embeddings.append(c_emb)
+
+        # Primary embedding: centroid of normalized angle vectors or first valid embedding
+        emb = None
+        if valid_embeddings:
+            avg_vec = np.mean(valid_embeddings, axis=0)
+            norm = np.linalg.norm(avg_vec)
+            emb = (avg_vec / norm).astype(np.float32) if norm > 1e-6 else valid_embeddings[0]
 
         # Check if the uploaded face matches an existing auto-assigned visitor in the gallery
         matched_auto_vis = None
@@ -3005,11 +3015,14 @@ class FaceTrackerEngine:
         if emb is None:
             # Generate unit normalized embedding if no photo provided
             rng = np.random.RandomState(abs(hash(target_name)) % (2**31))
-            emb = rng.randn(128).astype(np.float32)
+            emb = rng.randn(512 if getattr(self, 'arcface_sess', None) is not None else 128).astype(np.float32)
             emb = emb / np.linalg.norm(emb)
+            valid_embeddings = [emb]
 
+        primary_photo = valid_crops[0] if valid_crops else (photo_b64 or '')
+        crops = valid_crops if valid_crops else ([photo_b64] if photo_b64 else [])
+        all_embs = valid_embeddings if valid_embeddings else [emb]
         emb_json = json.dumps(emb.tolist())
-        crops = [photo_b64] if photo_b64 else []
         crops_json = json.dumps(crops)
 
         with self.matrix_lock:
@@ -3029,10 +3042,10 @@ class FaceTrackerEngine:
 
                 if old_id in self.unique_cache_by_id:
                     old_prof = self.unique_cache_by_id.pop(old_id, {})
-                    if not photo_b64 and old_prof.get('photo_b64'):
-                        photo_b64 = old_prof.get('photo_b64')
+                    if not crops and old_prof.get('crops'):
                         crops = old_prof.get('crops', [])
                         crops_json = json.dumps(crops)
+                        primary_photo = old_prof.get('photo_b64') or (crops[0] if crops else '')
                 self.unique_cache = [v for v in self.unique_cache if v.get('id') != old_id]
 
             # Update or create profile in memory (ALWAYS is_enrolled = 1!)
@@ -3044,11 +3057,11 @@ class FaceTrackerEngine:
                 prof['department'] = department
                 prof['designation'] = designation
                 prof['last_seen'] = now_iso
-                if photo_b64:
-                    prof['photo_b64'] = photo_b64
-                    prof['crops'] = [photo_b64] + [c for c in prof.get('crops', []) if c != photo_b64][:7]
+                if primary_photo:
+                    prof['photo_b64'] = primary_photo
+                    prof['crops'] = crops
                     prof['embedding'] = emb
-                    prof['embeddings'] = [emb] + prof.get('embeddings', [])[:7]
+                    prof['embeddings'] = all_embs
             else:
                 prof = {
                     'id': target_id,
@@ -3061,10 +3074,10 @@ class FaceTrackerEngine:
                     'gender_locked': True,
                     'age': 35,
                     'embedding': emb,
-                    'embeddings': [emb],
+                    'embeddings': all_embs,
                     'last_seen': now_iso,
                     'last_seen_epoch': time.time(),
-                    'photo_b64': photo_b64,
+                    'photo_b64': primary_photo,
                     'crops': crops,
                     'best_quality': 50.0,
                     'last_camera': 'main',
@@ -3093,7 +3106,7 @@ class FaceTrackerEngine:
                     embedding_json = CASE WHEN excluded.embedding_json IS NOT NULL THEN excluded.embedding_json ELSE unique_visitors.embedding_json END,
                     enrollment_date = excluded.enrollment_date,
                     last_seen = excluded.last_seen
-            """, (target_id, target_id, target_name, department, designation, emb_json, photo_b64, crops_json, now_iso, now_iso, now_iso))
+            """, (target_id, target_id, target_name, department, designation, emb_json, primary_photo, crops_json, now_iso, now_iso, now_iso))
         ])
 
         clean_prof = {k: v for k, v in prof.items() if k not in ('embedding', 'embeddings')}
@@ -4984,8 +4997,9 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
             dept = (body.get('department') or 'General Staff').strip()
             desig = (body.get('designation') or 'Staff Member').strip()
             photo = body.get('photo_b64')
+            photos = body.get('photos_b64')
             exist_id = body.get('existing_id') or body.get('visitor_id')
-            prof = tracker.enroll_employee(name=name, employee_id=emp_id, department=dept, designation=desig, photo_b64=photo, existing_id=exist_id)
+            prof = tracker.enroll_employee(name=name, employee_id=emp_id, department=dept, designation=desig, photo_b64=photo, photos_b64=photos, existing_id=exist_id)
             return self.send_json(200, {'success': True, 'employee': prof, 'employees': tracker.get_recent_visitors(limit=100)})
 
         if path == '/api/employees/update':
