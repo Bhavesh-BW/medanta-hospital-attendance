@@ -658,7 +658,7 @@ export default function App() {
       </div>
 
       {/* Top 4 Attendance KPI Cards */}
-      <KpiCards kpis={kpis} period={trendRange} />
+      <KpiCards kpis={kpis} period={trendRange} onDataRefresh={fetchData} />
 
       {/* Dynamic Multi-Camera Main Stage (LiveHudFeed + TrafficTrendChart) */}
       {viewMode === 'grid' ? (

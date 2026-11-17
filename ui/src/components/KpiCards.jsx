@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { useState } from 'react';
 
-export default function KpiCards({ kpis, period = 'today' }) {
+export default function KpiCards({ kpis, period = 'today', onDataRefresh }) {
   const p = (kpis?.period || period || 'today').toLowerCase();
   const periodLabelMap = {
     today: 'Today (Live Shift)',
@@ -24,6 +24,55 @@ export default function KpiCards({ kpis, period = 'today' }) {
   const productivityIndex = kpis?.productivity_index ?? 92.4;
   const avgStops = kpis?.avg_movement_stops ?? 2.1;
   const timeAtWork = kpis?.time_at_work_area ?? 88.6;
+
+  // Late Arrival Threshold Management
+  const lateTimeDisplay = kpis?.late_arrival_display || '09:00 AM';
+  const lateThresholdTime = kpis?.late_arrival_time || '09:00';
+  const [showLateModal, setShowLateModal] = useState(false);
+  const [selectedLateTime, setSelectedLateTime] = useState(lateThresholdTime);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveSuccessMsg, setSaveSuccessMsg] = useState('');
+  const [saveError, setSaveError] = useState('');
+
+  const PRESETS = [
+    { label: '08:00 AM', value: '08:00' },
+    { label: '08:30 AM', value: '08:30' },
+    { label: '09:00 AM', value: '09:00' },
+    { label: '09:15 AM', value: '09:15' },
+    { label: '09:30 AM', value: '09:30' },
+    { label: '10:00 AM', value: '10:00' }
+  ];
+
+  const handleSaveThreshold = async (timeValue) => {
+    const val = timeValue || selectedLateTime;
+    if (!val) return;
+    setIsSaving(true);
+    setSaveError('');
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ late_arrival_time: val })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSaveSuccessMsg(`Shift threshold updated to ${data.late_arrival_display || val}!`);
+        if (onDataRefresh) {
+          onDataRefresh();
+        }
+        setTimeout(() => {
+          setShowLateModal(false);
+          setSaveSuccessMsg('');
+        }, 900);
+      } else {
+        setSaveError('Failed to save settings. Please try again.');
+      }
+    } catch (e) {
+      setSaveError(e.message || 'Connection error');
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   const cards = [
     {
@@ -81,7 +130,35 @@ export default function KpiCards({ kpis, period = 'today' }) {
       label: 'Late Arrivals',
       value: Number(lateArrivals).toLocaleString(),
       secondary: `(${latePct}%)`,
-      subtext: 'Check-in after 09:00 AM shift start',
+      subtext: `After ${lateTimeDisplay} shift start`,
+      action: (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            setSelectedLateTime(kpis?.late_arrival_time || '09:00');
+            setShowLateModal(true);
+          }}
+          title="Configure Late Arrival Shift Threshold"
+          style={{
+            marginTop: '3px',
+            background: '#fff7ed',
+            border: '1px solid #fed7aa',
+            color: '#c2410c',
+            borderRadius: '4px',
+            padding: '2px 7px',
+            fontSize: '9.5px',
+            fontWeight: '700',
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '3px',
+            lineHeight: '1.2'
+          }}
+        >
+          <span>⚙</span>
+          <span>Shift Time: {lateTimeDisplay}</span>
+        </button>
+      ),
       accent: '#ea580c', // Orange
       bgLight: '#ffedd5',
       icon: (
@@ -167,77 +244,293 @@ export default function KpiCards({ kpis, period = 'today' }) {
   ];
 
   return (
-    <div className="kpi-cards-grid">
-      {cards.map((card) => (
-        <div 
-          key={card.id}
-          className="med-card"
+    <>
+      <div className="kpi-cards-grid">
+        {cards.map((card) => (
+          <div 
+            key={card.id}
+            className="med-card"
+            style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '12px',
+              border: '1px solid #e2e8f0',
+              padding: '10px 10px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '10px',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
+              transition: 'transform 0.15s ease, box-shadow 0.15s ease'
+            }}
+          >
+            <div style={{
+              width: '34px',
+              height: '34px',
+              borderRadius: '50%',
+              backgroundColor: card.bgLight,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0
+            }}>
+              {card.icon}
+            </div>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{
+                fontSize: '11px',
+                fontWeight: '700',
+                color: '#64748b',
+                marginBottom: '2px',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis'
+              }}>
+                {card.label}
+              </div>
+              <div style={{
+                fontSize: '18px',
+                fontWeight: '800',
+                color: '#0f172a',
+                lineHeight: '1.2',
+                display: 'flex',
+                alignItems: 'baseline',
+                gap: '4px',
+                flexWrap: 'wrap'
+              }}>
+                <span>{card.value}</span>
+                {card.secondary && (
+                  <span style={{ fontSize: '11px', fontWeight: '700', color: card.accent }}>
+                    {card.secondary}
+                  </span>
+                )}
+              </div>
+              <div style={{
+                fontSize: '10px',
+                color: '#94a3b8',
+                marginTop: '2px',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis'
+              }}>
+                {card.subtext}
+              </div>
+              {card.action && (
+                <div>{card.action}</div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Late Arrival Threshold Settings Modal */}
+      {showLateModal && (
+        <div
           style={{
-            backgroundColor: '#ffffff',
-            borderRadius: '12px',
-            border: '1px solid #e2e8f0',
-            padding: '10px 10px',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '10px',
-            boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
-            transition: 'transform 0.15s ease, box-shadow 0.15s ease'
-          }}
-        >
-          <div style={{
-            width: '34px',
-            height: '34px',
-            borderRadius: '50%',
-            backgroundColor: card.bgLight,
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(15, 23, 42, 0.45)',
+            backdropFilter: 'blur(3px)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            flexShrink: 0
-          }}>
-            {card.icon}
-          </div>
-          <div style={{ minWidth: 0, flex: 1 }}>
+            zIndex: 9999,
+            padding: '16px'
+          }}
+          onClick={() => setShowLateModal(false)}
+        >
+          <div
+            style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '16px',
+              maxWidth: '460px',
+              width: '100%',
+              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.1)',
+              border: '1px solid #e2e8f0',
+              overflow: 'hidden'
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
             <div style={{
-              fontSize: '11px',
-              fontWeight: '700',
-              color: '#64748b',
-              marginBottom: '2px',
-              whiteSpace: 'nowrap',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis'
-            }}>
-              {card.label}
-            </div>
-            <div style={{
-              fontSize: '18px',
-              fontWeight: '800',
-              color: '#0f172a',
-              lineHeight: '1.2',
+              padding: '16px 20px',
+              borderBottom: '1px solid #f1f5f9',
               display: 'flex',
-              alignItems: 'baseline',
-              gap: '4px',
-              flexWrap: 'wrap'
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              backgroundColor: '#f8fafc'
             }}>
-              <span>{card.value}</span>
-              {card.secondary && (
-                <span style={{ fontSize: '11px', fontWeight: '700', color: card.accent }}>
-                  {card.secondary}
-                </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{
+                  width: '32px',
+                  height: '32px',
+                  borderRadius: '8px',
+                  backgroundColor: '#ffedd5',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}>
+                  <span style={{ fontSize: '16px' }}>⏰</span>
+                </div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: '15px', fontWeight: '800', color: '#0f172a' }}>
+                    Configure Shift Start / Late Cutoff
+                  </h3>
+                  <p style={{ margin: '1px 0 0 0', fontSize: '11px', color: '#64748b' }}>
+                    Staff checking in after this time will be flagged as Late Arrivals
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowLateModal(false)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  fontSize: '18px',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                  padding: '4px',
+                  borderRadius: '4px'
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div style={{ padding: '20px' }}>
+              <div style={{ marginBottom: '16px' }}>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '8px' }}>
+                  Quick Shift Start Presets:
+                </label>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
+                  {PRESETS.map((preset) => {
+                    const isSelected = selectedLateTime === preset.value;
+                    return (
+                      <button
+                        key={preset.value}
+                        type="button"
+                        onClick={() => setSelectedLateTime(preset.value)}
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: '8px',
+                          border: isSelected ? '2px solid #ea580c' : '1px solid #e2e8f0',
+                          backgroundColor: isSelected ? '#fff7ed' : '#ffffff',
+                          color: isSelected ? '#ea580c' : '#334155',
+                          fontWeight: isSelected ? '800' : '600',
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                          transition: 'all 0.15s ease'
+                        }}
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div style={{ marginBottom: '18px' }}>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '6px' }}>
+                  Or Custom Threshold (24h HH:MM):
+                </label>
+                <input
+                  type="time"
+                  value={selectedLateTime}
+                  onChange={(e) => setSelectedLateTime(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '8px 12px',
+                    borderRadius: '8px',
+                    border: '1px solid #cbd5e1',
+                    fontSize: '14px',
+                    fontWeight: '700',
+                    color: '#0f172a',
+                    boxSizing: 'border-box'
+                  }}
+                />
+              </div>
+
+              {saveSuccessMsg && (
+                <div style={{
+                  padding: '8px 12px',
+                  backgroundColor: '#ecfdf5',
+                  border: '1px solid #a7f3d0',
+                  color: '#065f46',
+                  borderRadius: '6px',
+                  fontSize: '12px',
+                  fontWeight: '700',
+                  marginBottom: '12px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px'
+                }}>
+                  <span>✓</span> {saveSuccessMsg}
+                </div>
+              )}
+
+              {saveError && (
+                <div style={{
+                  padding: '8px 12px',
+                  backgroundColor: '#fef2f2',
+                  border: '1px solid #fecaca',
+                  color: '#991b1b',
+                  borderRadius: '6px',
+                  fontSize: '12px',
+                  fontWeight: '700',
+                  marginBottom: '12px'
+                }}>
+                  {saveError}
+                </div>
               )}
             </div>
+
+            {/* Modal Footer */}
             <div style={{
-              fontSize: '10px',
-              color: '#94a3b8',
-              marginTop: '2px',
-              whiteSpace: 'nowrap',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis'
+              padding: '12px 20px',
+              backgroundColor: '#f8fafc',
+              borderTop: '1px solid #f1f5f9',
+              display: 'flex',
+              justifyContent: 'flex-end',
+              gap: '10px'
             }}>
-              {card.subtext}
+              <button
+                type="button"
+                onClick={() => setShowLateModal(false)}
+                disabled={isSaving}
+                style={{
+                  padding: '8px 16px',
+                  borderRadius: '8px',
+                  border: '1px solid #cbd5e1',
+                  backgroundColor: '#ffffff',
+                  color: '#475569',
+                  fontSize: '12px',
+                  fontWeight: '700',
+                  cursor: 'pointer'
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSaveThreshold(selectedLateTime)}
+                disabled={isSaving}
+                style={{
+                  padding: '8px 18px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  backgroundColor: '#ea580c',
+                  color: '#ffffff',
+                  fontSize: '12px',
+                  fontWeight: '800',
+                  cursor: isSaving ? 'wait' : 'pointer',
+                  boxShadow: '0 1px 2px rgba(234, 88, 12, 0.3)'
+                }}
+              >
+                {isSaving ? 'Updating...' : 'Save & Recalculate'}
+              </button>
             </div>
           </div>
         </div>
-      ))}
-    </div>
+      )}
+    </>
   );
 }
