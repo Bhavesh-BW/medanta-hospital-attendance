@@ -2112,6 +2112,28 @@ class FaceTrackerEngine:
                 self.unique_cache.append(vis_obj)
                 self.unique_cache_by_id[vis_id] = vis_obj
 
+        # Seed today's active check-in attendance records into memory cache
+        try:
+            today_date = get_ist_date_str()
+            cur.execute('''
+                SELECT employee_id, check_in_time, check_out_time, status, is_checkout_verified
+                FROM daily_attendance
+                WHERE date = ?
+            ''', (today_date,))
+            att_count = 0
+            for emp_id, cin, cout, st, is_chk in cur.fetchall():
+                v = self.unique_cache_by_id.get(emp_id)
+                if v:
+                    v['today_check_in'] = cin
+                    v['today_check_out'] = cout
+                    v['today_status'] = st or ('checked_out' if cout else 'in_hospital')
+                    v['last_in_time'] = cin
+                    v['is_checkout_verified'] = bool(is_chk)
+                    att_count += 1
+            print(f"[ATTENDANCE CACHE READY] Restored {att_count} active attendance check-ins for {today_date}!")
+        except Exception as e:
+            print("Failed to seed today attendance cache:", e)
+
         # Seed recent cross-camera transits from database history
         try:
             cur.execute('''
