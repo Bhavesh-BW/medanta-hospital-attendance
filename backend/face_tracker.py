@@ -1471,9 +1471,15 @@ class FaceTrackerEngine:
         if os.path.exists(arcface_path):
             try:
                 import onnxruntime as ort
-                self.arcface_sess = ort.InferenceSession(arcface_path, providers=['CPUExecutionProvider'])
+                avail = ort.get_available_providers()
+                providers = []
+                if 'CUDAExecutionProvider' in avail:
+                    providers.append('CUDAExecutionProvider')
+                providers.append('CPUExecutionProvider')
+                self.arcface_sess = ort.InferenceSession(arcface_path, providers=providers)
                 self.arcface_input_name = self.arcface_sess.get_inputs()[0].name
-                print("ArcFace 512-d (w600k_mbf.onnx) loaded successfully into ONNX Runtime!")
+                active_p = self.arcface_sess.get_providers()[0]
+                print(f"ArcFace 512-d (w600k_mbf.onnx) loaded successfully into ONNX Runtime on [{active_p}]!")
             except Exception as e:
                 print("Failed to load ArcFace ONNX model:", e)
 
