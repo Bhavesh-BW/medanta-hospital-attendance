@@ -27,6 +27,17 @@ FFMPEG_BIN = shutil.which('ffmpeg') or (
     else None
 )
 
+def _check_ffmpeg_cuda_hwaccel():
+    if not FFMPEG_BIN:
+        return False
+    try:
+        res = subprocess.run([FFMPEG_BIN, "-hwaccels"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+        return b'cuda' in res.stdout.lower()
+    except Exception:
+        return False
+
+FFMPEG_CUDA_HWACCEL = _check_ffmpeg_cuda_hwaccel()
+
 # ── IST Timezone Configuration (+05:30) ─────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30), name='IST')
 
@@ -556,56 +567,67 @@ class CameraStreamPipeline:
 
             # High-Speed Native FFmpeg Frame Grabber for RTSP Streams
             if is_rtsp and FFMPEG_BIN:
-                cmd = [
-                    FFMPEG_BIN,
-                    "-rtsp_transport", "tcp",
-                    "-fflags", "nobuffer+discardcorrupt",
-                    "-flags", "low_delay",
-                    "-analyzeduration", "500000",
-                    "-probesize", "500000",
-                    "-i", self.rtsp_url,
-                    "-f", "rawvideo",
-                    "-pix_fmt", "bgr24",
-                    "-s", "1280x720",
-                    "-r", "25",
-                    "-an", "-sn",
-                    "pipe:1"
-                ]
-                proc = None
-                try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.DEVNULL,
-                        bufsize=1280 * 720 * 3 * 2
-                    )
-                    self.proc = proc
-                    frame_bytes = 1280 * 720 * 3
+                use_cuda = FFMPEG_CUDA_HWACCEL
+                for attempt in range(2):
+                    cmd = [FFMPEG_BIN]
+                    if use_cuda:
+                        cmd.extend(["-hwaccel", "cuda"])
+                    cmd.extend([
+                        "-rtsp_transport", "tcp",
+                        "-fflags", "nobuffer+discardcorrupt",
+                        "-flags", "low_delay",
+                        "-analyzeduration", "500000",
+                        "-probesize", "500000",
+                        "-i", self.rtsp_url,
+                        "-f", "rawvideo",
+                        "-pix_fmt", "bgr24",
+                        "-s", "1280x720",
+                        "-r", "25",
+                        "-an", "-sn",
+                        "pipe:1"
+                    ])
+                    proc = None
+                    got_any_frame = False
+                    try:
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            bufsize=1280 * 720 * 3 * 2
+                        )
+                        self.proc = proc
+                        frame_bytes = 1280 * 720 * 3
 
-                    while self.running and self.generation == gen:
-                        raw = proc.stdout.read(frame_bytes)
-                        if len(raw) != frame_bytes:
-                            break
-                        frame = np.frombuffer(raw, dtype=np.uint8).reshape((720, 1280, 3))
-                        with self.lock:
-                            self.is_rtsp_connected = True
-                            self.error_msg = None
-                            self.latest_frame = frame
-                            self._frame_seq = getattr(self, '_frame_seq', 0) + 1
-                            self.lock.notify_all()
-                except Exception as e:
-                    print(f"[{self.camera_id} FFMPEG ERROR]:", e)
-                finally:
-                    if proc:
-                        try:
-                            proc.terminate()
-                            proc.wait(timeout=0.5)
-                        except Exception:
+                        while self.running and self.generation == gen:
+                            raw = proc.stdout.read(frame_bytes)
+                            if len(raw) != frame_bytes:
+                                break
+                            got_any_frame = True
+                            frame = np.frombuffer(raw, dtype=np.uint8).reshape((720, 1280, 3))
+                            with self.lock:
+                                self.is_rtsp_connected = True
+                                self.error_msg = None
+                                self.latest_frame = frame
+                                self._frame_seq = getattr(self, '_frame_seq', 0) + 1
+                                self.lock.notify_all()
+                    except Exception as e:
+                        print(f"[{self.camera_id} FFMPEG ERROR (cuda={use_cuda})]:", e)
+                    finally:
+                        if proc:
                             try:
-                                proc.kill()
+                                proc.terminate()
+                                proc.wait(timeout=0.5)
                             except Exception:
-                                pass
-                    self.proc = None
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                        self.proc = None
+
+                    if got_any_frame or not use_cuda or not self.running or self.generation != gen:
+                        break
+                    # If CUDA failed to produce frames on first try, fallback to standard CPU decoder
+                    use_cuda = False
 
                 with self.lock:
                     self.is_rtsp_connected = False
