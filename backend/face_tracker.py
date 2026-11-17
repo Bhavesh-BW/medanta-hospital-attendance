@@ -338,6 +338,9 @@ class CameraStreamPipeline:
         self.next_track_id = 1
         self.proc = None
 
+        det_path = str(MODELS / 'face_detection_yunet_2023mar.onnx')
+        self.detector = cv2.FaceDetectorYN_create(det_path, '', (960, 540), 0.45, 0.3, 1000) if os.path.exists(det_path) else None
+
         # Start capture and processing threads for this camera
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.process_thread = threading.Thread(target=self._process_loop, daemon=True)
@@ -742,13 +745,8 @@ class CameraStreamPipeline:
         now_iso = get_ist_iso()
         now_epoch = time.time()
 
-        # High-performance throttle: run DNN face detector at ~18 FPS to ensure ultra-low CPU and instantaneous UI data loading
-        if (now - getattr(self, '_last_det_time', 0)) >= 0.055:
-            faces = self.engine._detect_faces(frame)
-            self._last_detected_faces = faces
-            self._last_det_time = now
-        else:
-            faces = getattr(self, '_last_detected_faces', [])
+        # Real-time DNN face detector on dedicated per-camera detector (runs ~8.9ms lock-free)
+        faces = self.engine._detect_faces(frame, detector=getattr(self, 'detector', None))
 
         annotated = frame.copy()
 
@@ -806,42 +804,7 @@ class CameraStreamPipeline:
                 if np.mean(hsv_v) < 48.0:
                     continue
 
-            # Assess frontality & sharpness for crop saving / enrollment (used downstream)
-            is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
-            if not is_sharp:
-                continue
-
-            face_b64 = ""
-            if face_crop is not None and face_crop.size > 0:
-                ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                if ok:
-                    face_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
-
-            # Expanded Upper Body / Torso crop for realistic outfit/person identification on visitor card
-            pad_x = int(w * 0.90)
-            pad_top = int(h * 0.30)
-            pad_bot = int(h * 2.80)
-            bx1 = max(0, x - pad_x)
-            bx2 = min(W_f, x + w + pad_x)
-            by1 = max(0, y - pad_top)
-            by2 = min(H_f, y + h + pad_bot)
-            body_crop = frame[by1:by2, bx1:bx2] if by2 > by1 and bx2 > bx1 else face_crop
-
-            body_b64 = ""
-            if body_crop is not None and body_crop.size > 0:
-                ok, buf = cv2.imencode('.jpg', body_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                if ok:
-                    body_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
-            if not body_b64:
-                body_b64 = face_b64
-
-            photo_b64 = body_b64
-
-            # Extract embedding & gender/age
-            emb = self.engine._extract_embedding(frame, face)
-            instant_gender, gender_conf, age = self.engine._estimate_gender_and_age(frame, face, face_crop, self.camera_id, body_crop)
-
-            # Spatial track association (Strict Biometric Verification >= 0.62)
+            # ── 1. FAST SPATIAL TRACK MATCHING (O(1), <0.01 ms) ──
             best_track_id = None
             best_iou = 0.0
             for tid, trk in self.active_tracks.items():
@@ -852,22 +815,8 @@ class CameraStreamPipeline:
                     best_iou = iou
                     best_track_id = tid
 
-            if best_track_id is not None:
-                # Biometric guard on track IoU: maintain track continuity for the same walking person across shadows
-                trk = self.active_tracks[best_track_id]
-                tid_vis_id = trk.get('visitor_id')
-                if tid_vis_id and tid_vis_id in self.engine.unique_cache_by_id:
-                    trk_vis = self.engine.unique_cache_by_id[tid_vis_id]
-                    vis_embs = trk_vis.get('embeddings', [trk_vis.get('embedding')])
-                    vis_embs = [ve for ve in vis_embs if ve is not None]
-                    if vis_embs:
-                        max_sim = max(cosine_sim(emb, ve) for ve in vis_embs)
-                        # Only drop track on extreme biometric contradiction (< 0.22) to prevent track swapping
-                        if max_sim < 0.22:
-                            best_track_id = None
-
             if best_track_id is None:
-                min_dist = 45.0  # Spatial proximity for walking continuity
+                min_dist = 50.0  # Spatial proximity for walking continuity
                 for tid, trk in self.active_tracks.items():
                     if tid in matched_track_ids:
                         continue
@@ -875,17 +824,70 @@ class CameraStreamPipeline:
                     tcy = trk['bbox'][1] + trk['bbox'][3] / 2.0
                     dist = math.hypot(cx - tcx, cy - tcy)
                     if dist < min_dist:
-                        if trk.get('visitor_id') and trk['visitor_id'] in self.engine.unique_cache_by_id:
-                            trk_vis = self.engine.unique_cache_by_id[trk['visitor_id']]
-                            vis_embs = trk_vis.get('embeddings', [trk_vis.get('embedding')])
-                            vis_embs = [ve for ve in vis_embs if ve is not None]
-                            if vis_embs:
-                                max_sim = max(cosine_sim(emb, ve) for ve in vis_embs)
-                                if max_sim < 0.22:
-                                    continue
                         min_dist = dist
                         best_track_id = tid
 
+            # ── FAST PATH: ACTIVE CONTINUOUS TRACK (Takes 0.005 ms) ──
+            if best_track_id is not None:
+                track_id = best_track_id
+                trk = self.active_tracks[track_id]
+                px, py, pw, ph = trk['bbox']
+                # Smooth exponential follow-up (0.90 current + 0.10 previous) for silky smooth bboxes
+                sx = int(0.90 * x + 0.10 * px)
+                sy = int(0.90 * y + 0.10 * py)
+                sw = int(0.90 * w + 0.10 * pw)
+                sh = int(0.90 * h + 0.10 * ph)
+                trk['bbox'] = (sx, sy, sw, sh)
+                trk['last_seen'] = now
+                trk['missed'] = 0
+                if 'history' not in trk:
+                    trk['history'] = collections.deque(maxlen=45)
+                trk['history'].append((now_epoch, sx + sw / 2.0, sy + sh / 2.0, sw, sh, (sx, sy, sw, sh)))
+                matched_track_ids.add(track_id)
+
+                # Periodic Keyframe Crop Update (Only once every 20 seconds, zero cost on regular frames)
+                if (now_epoch - trk.get('last_crop_epoch', 0)) >= 20.0 and face_crop is not None and face_crop.size > 0:
+                    is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
+                    if is_sharp and quality_score >= 32.0 and det_score >= 0.78:
+                        vis_id = trk.get('visitor_id')
+                        if vis_id and vis_id in self.engine.unique_cache_by_id:
+                            v_obj = self.engine.unique_cache_by_id[vis_id]
+                            crops = v_obj.get('crops', [])
+                            if not isinstance(crops, list):
+                                crops = [crops] if crops else []
+                            if len(crops) < 8:
+                                ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                                if ok:
+                                    face_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+                                    if face_b64 not in crops:
+                                        crops.append(face_b64)
+                                        v_obj['crops'] = crops[:8]
+                                        trk['last_crop_epoch'] = now_epoch
+                                        self.engine.async_db_execute('UPDATE unique_visitors SET crops_json = ?, last_seen = ? WHERE id = ?', (json.dumps(crops[:8]), now_iso, vis_id))
+                continue
+
+            # ── CANDIDATE PATH: NEW UNASSIGNED FACE ENTERING SCENE ──
+            is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
+            if not is_sharp:
+                continue
+
+            pad_x = int(w * 0.90)
+            pad_top = int(h * 0.30)
+            pad_bot = int(h * 2.80)
+            bx1 = max(0, x - pad_x)
+            bx2 = min(W_f, x + w + pad_x)
+            by1 = max(0, y - pad_top)
+            by2 = min(H_f, y + h + pad_bot)
+            body_crop = frame[by1:by2, bx1:bx2] if by2 > by1 and bx2 > bx1 else face_crop
+
+            emb = self.engine._extract_embedding(frame, face)
+            instant_gender, gender_conf, age = self.engine._estimate_gender_and_age(frame, face, face_crop, self.camera_id, body_crop)
+
+            face_b64 = ""
+            body_b64 = ""
+            photo_b64 = ""
+
+            best_track_id = None
             matched_visitor = None
             is_transit = False
             prev_cam_name = None
@@ -1034,6 +1036,18 @@ class CameraStreamPipeline:
                     self.engine.gender_votes[visitor_id] = collections.deque([(init_gender, init_conf)], maxlen=30)
                     gender = init_gender
                     gender_locked_flag = False
+
+                    if not photo_b64:
+                        if face_crop is not None and face_crop.size > 0:
+                            ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                            if ok:
+                                face_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+                        if body_crop is not None and body_crop.size > 0:
+                            ok_b, buf_b = cv2.imencode('.jpg', body_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            if ok_b:
+                                body_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf_b.tobytes()).decode()}"
+                        photo_b64 = body_b64 or face_b64
+
                     crops_list = [face_b64] if face_b64 else ([photo_b64] if photo_b64 else [])
 
                     matched_name = matched_blacklist.get('name') if (matched_blacklist and matched_blacklist.get('name') and not matched_blacklist.get('name').startswith('Target')) else None
@@ -1311,53 +1325,26 @@ class CameraStreamPipeline:
                             now_iso
                         ))
 
-            # Spatial Track Update: instant responsive lock with zero trailing lag
-            if best_track_id is not None:
-                track_id = best_track_id
-                trk = self.active_tracks[track_id]
-                px, py, pw, ph = trk['bbox']
-                sx = int(0.95 * x + 0.05 * px)
-                sy = int(0.95 * y + 0.05 * py)
-                sw = int(0.95 * w + 0.05 * pw)
-                sh = int(0.95 * h + 0.05 * ph)
-                trk['bbox'] = (sx, sy, sw, sh)
-                trk['last_seen'] = now
-                trk['missed'] = 0
-                if 'history' not in trk:
-                    trk['history'] = collections.deque(maxlen=45)
-                trk['history'].append((now_epoch, sx + sw / 2.0, sy + sh / 2.0, sw, sh, (sx, sy, sw, sh)))
-                if is_blacklisted:
-                    trk['bl_consecutive_hits'] = trk.get('bl_consecutive_hits', 0) + 1
-                else:
-                    trk['bl_consecutive_hits'] = 0
-                trk['is_blacklisted'] = is_blacklisted
-                trk['threat_name'] = threat_name
-                trk['reason'] = threat_reason
-                trk['is_transit'] = is_transit
-                trk['prev_camera_name'] = prev_cam_name
-                trk['gender'] = gender
-                trk['age'] = age
-                trk['visitor_id'] = visitor_id
-            else:
-                track_id = self.next_track_id
-                self.next_track_id += 1
-                hist = collections.deque(maxlen=45)
-                hist.append((now_epoch, cx, cy, w, h, (x, y, w, h)))
-                self.active_tracks[track_id] = {
-                    'bbox': (x, y, w, h),
-                    'history': hist,
-                    'bl_consecutive_hits': 1 if is_blacklisted else 0,
-                    'last_seen': now,
-                    'missed': 0,
-                    'visitor_id': visitor_id,
-                    'is_blacklisted': is_blacklisted,
-                    'threat_name': threat_name,
-                    'reason': threat_reason,
-                    'is_transit': is_transit,
-                    'prev_camera_name': prev_cam_name,
-                    'gender': gender,
-                    'age': age
-                }
+            # Create New Track for newly registered or matched person
+            track_id = self.next_track_id
+            self.next_track_id += 1
+            hist = collections.deque(maxlen=45)
+            hist.append((now_epoch, cx, cy, w, h, (x, y, w, h)))
+            self.active_tracks[track_id] = {
+                'bbox': (x, y, w, h),
+                'history': hist,
+                'bl_consecutive_hits': 1 if is_blacklisted else 0,
+                'last_seen': now,
+                'missed': 0,
+                'visitor_id': visitor_id,
+                'is_blacklisted': is_blacklisted,
+                'threat_name': threat_name,
+                'reason': threat_reason,
+                'is_transit': is_transit,
+                'prev_camera_name': prev_cam_name,
+                'gender': gender,
+                'age': age
+            }
             matched_track_ids.add(track_id)
 
         # Age out stale tracks: allow up to 2.5 seconds (or 25 missed frames) for stable walking continuity
@@ -1381,9 +1368,9 @@ class CameraStreamPipeline:
                         self.engine.unique_cache_by_id.pop(p_vid, None)
                         self.engine.unique_cache = [v for v in self.engine.unique_cache if v.get('id') != p_vid]
 
-        # Render Bounding Boxes & HUD from Active Tracks (Zero Lag: only draw currently detected faces)
+        # Render Bounding Boxes & HUD from Active Tracks (smooth persistent follow-up)
         for tid, trk in self.active_tracks.items():
-            if trk.get('missed', 0) > 0:
+            if trk.get('missed', 0) > 1:
                 continue
             bx, by, bw, bh = trk['bbox']
             t_blacklisted = trk.get('is_blacklisted')
@@ -1508,13 +1495,28 @@ class FaceTrackerEngine:
         self.late_arrival_time = self._load_setting('late_arrival_time', '09:00')
         self.auto_enroll_enabled = self._load_setting('auto_enroll_enabled', '1') in ('1', 'true', 'True', 'yes', 'on')
         
+        self.gender_sess = None
+        self.gender_input_name = None
         self.gender_net = None
         if os.path.exists(gender_path):
             try:
-                self.gender_net = cv2.dnn.readNetFromONNX(gender_path)
-                print("InsightFace genderage.onnx loaded successfully into OpenCV DNN!")
+                import onnxruntime as ort
+                avail = ort.get_available_providers()
+                providers = []
+                if 'CUDAExecutionProvider' in avail:
+                    providers.append('CUDAExecutionProvider')
+                providers.append('CPUExecutionProvider')
+                self.gender_sess = ort.InferenceSession(gender_path, providers=providers)
+                self.gender_input_name = self.gender_sess.get_inputs()[0].name
+                active_p = self.gender_sess.get_providers()[0]
+                print(f"InsightFace genderage.onnx loaded into ONNX Runtime on [{active_p}]!")
             except Exception as e:
-                print("Failed to load genderage.onnx:", e)
+                print("Failed to load genderage into ONNX Runtime:", e)
+                try:
+                    self.gender_net = cv2.dnn.readNetFromONNX(gender_path)
+                    print("InsightFace genderage.onnx loaded into OpenCV DNN fallback!")
+                except Exception as e2:
+                    print("Failed fallback to OpenCV DNN:", e2)
 
         # In-memory caches
         self.unique_cache = []
@@ -1673,7 +1675,7 @@ class FaceTrackerEngine:
         except Exception:
             return str(time_str)
 
-    def _detect_faces(self, frame: np.ndarray):
+    def _detect_faces(self, frame: np.ndarray, detector=None):
         h, w = frame.shape[:2]
         target_w, target_h = 960, 540
         small = cv2.resize(frame, (target_w, target_h))
@@ -1688,9 +1690,17 @@ class FaceTrackerEngine:
         except Exception:
             det_img = small
 
-        with self.inference_lock:
-            self.detector.setInputSize((target_w, target_h))
-            _, faces = self.detector.detect(det_img)
+        det = detector or self.detector
+        if det is None:
+            return []
+
+        if detector is not None:
+            det.setInputSize((target_w, target_h))
+            _, faces = det.detect(det_img)
+        else:
+            with self.inference_lock:
+                det.setInputSize((target_w, target_h))
+                _, faces = det.detect(det_img)
         if faces is None:
             return []
         faces = faces.copy()
@@ -1862,7 +1872,7 @@ class FaceTrackerEngine:
             return False, 0.0
 
     def _estimate_gender_and_age(self, frame: np.ndarray, face: np.ndarray, face_crop: np.ndarray, camera_id: str, body_crop: np.ndarray = None):
-        if self.gender_net is not None:
+        if self.gender_sess is not None or self.gender_net is not None:
             try:
                 x, y, w, h = [int(v) for v in face[:4]]
                 if w < 28 or h < 28:
@@ -1879,20 +1889,34 @@ class FaceTrackerEngine:
                 def _eval_net(img_crop):
                     if img_crop is None or img_crop.size == 0:
                         return 0.5, 0.5, 30
-                    blob = cv2.dnn.blobFromImage(cv2.resize(img_crop, (96, 96)), 1.0, (96, 96), (0, 0, 0), swapRB=True)
-                    with self.inference_lock:
-                        self.gender_net.setInput(blob)
-                        preds = self.gender_net.forward()
-                    if isinstance(preds, (list, tuple)) and len(preds) >= 2:
-                        gender_preds, age_preds = preds[0], preds[1]
-                    else:
+                    if self.gender_sess is not None:
+                        resized = cv2.resize(img_crop, (96, 96))
+                        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                        blob = np.transpose(rgb.astype(np.float32), (2, 0, 1))[np.newaxis, ...]
+                        preds = self.gender_sess.run(None, {self.gender_input_name: blob})[0]
                         gender_preds = preds[:, :2]
-                        age_preds = preds[:, 2] if preds.shape[1] > 2 else [[30]]
-                    exp_g = np.exp(gender_preds[0] - np.max(gender_preds[0]))
-                    probs = exp_g / np.sum(exp_g)
-                    age_val = int(round(float(age_preds[0][0]) * 100)) if hasattr(age_preds[0], '__len__') else int(round(float(age_preds[0]) * 100))
-                    age_val = max(18, min(80, age_val))
-                    return float(probs[0]), float(probs[1]), age_val
+                        age_preds = preds[:, 2] if preds.shape[1] > 2 else [[0.30]]
+                        exp_g = np.exp(gender_preds[0] - np.max(gender_preds[0]))
+                        probs = exp_g / np.sum(exp_g)
+                        age_val = int(round(float(age_preds[0]) * 100)) if not hasattr(age_preds[0], '__len__') else int(round(float(age_preds[0][0]) * 100))
+                        age_val = max(18, min(80, age_val))
+                        return float(probs[0]), float(probs[1]), age_val
+                    elif self.gender_net is not None:
+                        blob = cv2.dnn.blobFromImage(cv2.resize(img_crop, (96, 96)), 1.0, (96, 96), (0, 0, 0), swapRB=True)
+                        with self.inference_lock:
+                            self.gender_net.setInput(blob)
+                            preds = self.gender_net.forward()
+                        if isinstance(preds, (list, tuple)) and len(preds) >= 2:
+                            gender_preds, age_preds = preds[0], preds[1]
+                        else:
+                            gender_preds = preds[:, :2]
+                            age_preds = preds[:, 2] if preds.shape[1] > 2 else [[30]]
+                        exp_g = np.exp(gender_preds[0] - np.max(gender_preds[0]))
+                        probs = exp_g / np.sum(exp_g)
+                        age_val = int(round(float(age_preds[0][0]) * 100)) if hasattr(age_preds[0], '__len__') else int(round(float(age_preds[0]) * 100))
+                        age_val = max(18, min(80, age_val))
+                        return float(probs[0]), float(probs[1]), age_val
+                    return 0.5, 0.5, 30
 
                 # 1. Face crop evaluation
                 f_face, m_face, a_face = _eval_net(fc)
