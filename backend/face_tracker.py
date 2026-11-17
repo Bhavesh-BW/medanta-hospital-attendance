@@ -1440,8 +1440,15 @@ class CameraStreamPipeline:
             cv2.rectangle(annotated, (bx, tag_y - th - 5), (bx + tw + 10, tag_y + 3), tag_bg, -1)
             cv2.putText(annotated, tag, (bx + 5, tag_y - 2), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
-        # Fast unblocked JPEG encoding & publishing
-        ok, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # Fast unblocked JPEG encoding & publishing with adaptive quality to prevent bandwidth spikes
+        num_active = len(self.active_tracks)
+        if num_active >= 4:
+            jpeg_quality = 68
+        elif num_active >= 2:
+            jpeg_quality = 74
+        else:
+            jpeg_quality = 80
+        ok, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
         if ok:
             with self.lock:
                 self.latest_jpeg = jpeg.tobytes()
@@ -4876,6 +4883,14 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
             if not pipe:
                 return self.send_json(404, {'error': f'Camera {cam_id} not found'})
 
+            # Disable TCP buffering latency and set non-blocking transmission
+            try:
+                import socket
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.connection.settimeout(3.0)
+            except Exception:
+                pass
+
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
@@ -4885,14 +4900,20 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             seq = -1
+            last_send_ts = 0.0
+            min_interval = 0.045  # Cap delivery to smooth ~20-22 FPS to prevent TCP socket bloat
             try:
                 while tracker.running and pipe.running:
                     with pipe.lock:
-                        pipe.lock.wait_for(lambda: pipe.sequence != seq and pipe.latest_jpeg is not None, timeout=1.0)
+                        pipe.lock.wait_for(lambda: pipe.sequence != seq and pipe.latest_jpeg is not None, timeout=0.5)
                         if pipe.latest_jpeg is None or pipe.sequence == seq:
+                            continue
+                        now_m = time.monotonic()
+                        if (now_m - last_send_ts) < min_interval:
                             continue
                         seq = pipe.sequence
                         frame_bytes = pipe.latest_jpeg
+                        last_send_ts = now_m
 
                     header = (
                         b'--frame\r\n'
