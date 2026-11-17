@@ -13,7 +13,9 @@ export default function LiveHudFeed({
   onOpenJourney,
   viewMode = 'grid',
   onViewModeChange,
-  onDataRefresh
+  onDataRefresh,
+  watchlistCount = 0,
+  onOpenWatchlist
 }) {
   const [internalViewMode, setInternalViewMode] = useState(viewMode || 'grid');
   const currentViewMode = onViewModeChange ? viewMode : internalViewMode;
@@ -46,7 +48,7 @@ export default function LiveHudFeed({
 
   const [hudEnabled, setHudEnabled] = useState(true);
   const [streamKey, setStreamKey] = useState(Date.now());
-  const [quickBlacklistMode, setQuickBlacklistMode] = useState(true);
+  const [quickBlacklistMode, setQuickBlacklistMode] = useState(false);
   const [clickEffect, setClickEffect] = useState(null);
   const [feedNotification, setFeedNotification] = useState(null);
 
@@ -476,8 +478,34 @@ export default function LiveHudFeed({
             }}
           >
             <span>⚡</span>
-            <span>{quickBlacklistMode ? 'CLICK-TO-FLAG: ON' : 'CLICK-TO-FLAG'}</span>
+            <span>{quickBlacklistMode ? 'CLICK-TO-FLAG: ON' : 'CLICK-TO-FLAG: OFF'}</span>
           </button>
+
+          {/* Quick Jump to Security Watchlist */}
+          {onOpenWatchlist && (
+            <button
+              type="button"
+              onClick={onOpenWatchlist}
+              title="View Security Watchlist / Blacklisted Persons"
+              style={{
+                padding: '6px 12px',
+                borderRadius: '8px',
+                fontSize: '12px',
+                fontWeight: '800',
+                border: '1px solid #fecdd3',
+                backgroundColor: '#fff1f2',
+                color: '#e11d48',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                cursor: 'pointer',
+                transition: 'all 0.15s ease'
+              }}
+            >
+              <span>🚨</span>
+              <span>Watchlist: {watchlistCount || 0}</span>
+            </button>
+          )}
 
           {/* Refresh Streams */}
           <button

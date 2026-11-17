@@ -272,6 +272,7 @@ def init_db():
         )
     ''')
     cur.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('late_arrival_time', '09:00')")
+    cur.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('auto_enroll_enabled', '1')")
 
     conn.commit()
     conn.close()
@@ -736,9 +737,10 @@ class CameraStreamPipeline:
         for face in faces:
             x, y, w, h = [int(v) for v in face[:4]]
             det_score = float(face[-1])
-            min_det = 0.55 if is_exit_camera else 0.45
-            min_w = 22 if is_exit_camera else 18
-            min_h = 26 if is_exit_camera else 22
+            min_det = 0.55 if is_exit_camera else 0.48
+            # Reject tiny doorway silhouettes: must be close enough for clear biometrics & human verification
+            min_w = 32 if is_exit_camera else 28
+            min_h = 38 if is_exit_camera else 34
             if det_score < min_det or w < min_w or h < min_h:
                 continue
 
@@ -746,12 +748,17 @@ class CameraStreamPipeline:
             if is_exit_camera and x > 1200 and y > 650:
                 continue
 
+            # False Positive Filter 1B: Ground / Floor tiles exclusion (rejects floor tiles, carpets, shoe false faces)
+            # In 720p feeds, y > 585 px (bottom 18%) is strictly the floor tiles/mat
+            if y > 585 or (y + h) > 685:
+                continue
+
             # False Positive Filter 2: Anatomical 5-point landmark geometry (rejects hands, cuffs, buttons, clothing folds)
             if len(face) >= 8 and face[4] > 0 and face[6] > 0:
                 re_x, re_y = face[4], face[5]
                 le_x, le_y = face[6], face[7]
                 eye_dist = math.hypot(le_x - re_x, le_y - re_y)
-                if (eye_dist / max(w, 1)) < 0.15:
+                if (eye_dist / max(w, 1)) < 0.16:
                     continue
 
             cx = x + w / 2.0
@@ -771,9 +778,16 @@ class CameraStreamPipeline:
                 hsv_v = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)[:, :, 2]
                 if np.mean(hsv_v < 40) > 0.42:
                     continue
+                # Backlight / Doorway Silhouette rejection:
+                # Underexposed silhouettes at the sunlit doorway have mean brightness < 48.
+                # Clear human-verifiable faces in the corridor have mean brightness >= 48.
+                if np.mean(hsv_v) < 48.0:
+                    continue
 
             # Assess frontality & sharpness for crop saving / enrollment (used downstream)
             is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
+            if not is_sharp:
+                continue
 
             face_b64 = ""
             if face_crop is not None and face_crop.size > 0:
@@ -805,7 +819,7 @@ class CameraStreamPipeline:
             emb = self.engine._extract_embedding(frame, face)
             instant_gender, gender_conf, age = self.engine._estimate_gender_and_age(frame, face, face_crop, self.camera_id, body_crop)
 
-            # Spatial track association
+            # Spatial track association (Strict Biometric Verification >= 0.62)
             best_track_id = None
             best_iou = 0.0
             for tid, trk in self.active_tracks.items():
@@ -816,8 +830,22 @@ class CameraStreamPipeline:
                     best_iou = iou
                     best_track_id = tid
 
+            if best_track_id is not None:
+                # Biometric guard on track IoU: maintain track continuity for the same walking person across shadows
+                trk = self.active_tracks[best_track_id]
+                tid_vis_id = trk.get('visitor_id')
+                if tid_vis_id and tid_vis_id in self.engine.unique_cache_by_id:
+                    trk_vis = self.engine.unique_cache_by_id[tid_vis_id]
+                    vis_embs = trk_vis.get('embeddings', [trk_vis.get('embedding')])
+                    vis_embs = [ve for ve in vis_embs if ve is not None]
+                    if vis_embs:
+                        max_sim = max(cosine_sim(emb, ve) for ve in vis_embs)
+                        # Only drop track on extreme biometric contradiction (< 0.22) to prevent track swapping
+                        if max_sim < 0.22:
+                            best_track_id = None
+
             if best_track_id is None:
-                min_dist = 140.0
+                min_dist = 45.0  # Spatial proximity for walking continuity
                 for tid, trk in self.active_tracks.items():
                     if tid in matched_track_ids:
                         continue
@@ -827,8 +855,12 @@ class CameraStreamPipeline:
                     if dist < min_dist:
                         if trk.get('visitor_id') and trk['visitor_id'] in self.engine.unique_cache_by_id:
                             trk_vis = self.engine.unique_cache_by_id[trk['visitor_id']]
-                            if cosine_sim(emb, trk_vis['embedding']) < 0.20:
-                                continue
+                            vis_embs = trk_vis.get('embeddings', [trk_vis.get('embedding')])
+                            vis_embs = [ve for ve in vis_embs if ve is not None]
+                            if vis_embs:
+                                max_sim = max(cosine_sim(emb, ve) for ve in vis_embs)
+                                if max_sim < 0.22:
+                                    continue
                         min_dist = dist
                         best_track_id = tid
 
@@ -836,23 +868,27 @@ class CameraStreamPipeline:
             is_transit = False
             prev_cam_name = None
 
-            # Check recently closed tracks (within last 2.5 seconds)
+            # Check recently closed tracks within 1.5 seconds
             if best_track_id is None and getattr(self, 'recently_closed_tracks', None):
                 for trk in self.recently_closed_tracks:
-                    if (now_epoch - trk.get('last_seen_epoch', 0)) <= 2.5:
+                    if (now_epoch - trk.get('last_seen_epoch', 0)) <= 1.5:
                         tcx = trk['bbox'][0] + trk['bbox'][2] / 2.0
                         tcy = trk['bbox'][1] + trk['bbox'][3] / 2.0
-                        if math.hypot(cx - tcx, cy - tcy) < 140.0:
+                        if math.hypot(cx - tcx, cy - tcy) < 60.0:
                             tid_vis = trk.get('visitor_id')
                             if tid_vis and tid_vis in self.engine.unique_cache_by_id:
-                                matched_visitor = self.engine.unique_cache_by_id[tid_vis]
-                                break
+                                trk_vis = self.engine.unique_cache_by_id[tid_vis]
+                                vis_embs = trk_vis.get('embeddings', [trk_vis.get('embedding')])
+                                vis_embs = [ve for ve in vis_embs if ve is not None]
+                                if vis_embs and max(cosine_sim(emb, ve) for ve in vis_embs) >= 0.45:
+                                    matched_visitor = trk_vis
+                                    break
 
             # 1. Watchlist Screening via Vector Matrix with High-Confidence Filter
             matched_blacklist, max_bl_sim = self.engine.search_watchlist(emb, threshold=0.50)
 
             # 2. Match Visitor Profile
-            # Priority A: Spatial track continuity (O(1))
+            # Priority A: Spatial track continuity (O(1)) - maintain single person identity along track
             if matched_visitor is None and best_track_id is not None:
                 tid_vis_id = self.active_tracks[best_track_id].get('visitor_id')
                 if tid_vis_id and tid_vis_id in self.engine.unique_cache_by_id:
@@ -883,11 +919,17 @@ class CameraStreamPipeline:
                 if alias and alias in self.engine.unique_cache_by_id:
                     matched_visitor = self.engine.unique_cache_by_id[alias]
 
+            is_exit_camera = (getattr(self, 'role', 'entry') == 'exit') or ('exit' in self.camera_id.lower()) or ('exit' in self.name.lower())
+
             # Priority C: Vector Matrix Search (<0.3ms across thousands of faces)
             if matched_visitor is None:
                 matched_visitor, max_vis_sim = self.engine.search_gallery(
-                    emb, threshold=0.52, recent_threshold=0.48,
-                    query_gender=instant_gender, gender_conf=gender_conf
+                    emb,
+                    threshold=0.66 if is_exit_camera else 0.62,
+                    recent_threshold=0.64 if is_exit_camera else 0.58,
+                    query_gender=instant_gender,
+                    gender_conf=gender_conf,
+                    is_exit=is_exit_camera
                 )
                 # Secondary verification: confirm match against stored embeddings of this visitor
                 if matched_visitor is not None:
@@ -896,12 +938,41 @@ class CameraStreamPipeline:
                     if vis_embs:
                         all_sims = [cosine_sim(emb, ve) for ve in vis_embs]
                         max_indiv_sim = max(all_sims)
-                        # Require at least one crop match >= 0.48
-                        if max_indiv_sim < 0.48:
+                        min_crop_sim = 0.62 if is_exit_camera else 0.55
+                        if max_indiv_sim < min_crop_sim:
                             matched_visitor = None
                             max_vis_sim = 0.0
 
-            is_exit_camera = (getattr(self, 'role', 'entry') == 'exit') or ('exit' in self.camera_id.lower()) or ('exit' in self.name.lower())
+            # Multi-frame concordance check on exit camera:
+            # Prevents 1-frame spurious glance from falsely checking out someone else!
+            if is_exit_camera and matched_visitor is not None:
+                # Can ONLY check out if the person is ACTUALLY checked in today!
+                if matched_visitor.get('today_status') != 'in_hospital' and not matched_visitor.get('today_check_in'):
+                    matched_visitor = None
+                else:
+                    if best_track_id is not None:
+                        trk = self.active_tracks[best_track_id]
+                        hits = trk.get('exit_concordant_hits', 0) + 1
+                        trk['exit_concordant_hits'] = hits
+                        if hits < 3:
+                            continue
+
+            # Priority D: Auto-Enrollment Deduplication Buffer (prevents duplicate EMP IDs within 60s)
+            if matched_visitor is None and not is_exit_camera:
+                # 1. Spatial-temporal corridor gate: if a profile was enrolled nearby in last 6s on this camera, it is the SAME walking person!
+                for prev_ep, prev_vid, prev_emb, prev_cam, prev_x, prev_y in getattr(self.engine, 'recent_auto_enrolled_locs', []):
+                    if prev_cam == self.camera_id and (now_epoch - prev_ep) <= 6.0 and math.hypot(cx - prev_x, cy - prev_y) < 100.0:
+                        if prev_vid in self.engine.unique_cache_by_id:
+                            matched_visitor = self.engine.unique_cache_by_id[prev_vid]
+                            break
+                # 2. Biometric deduplication within 60s
+                if matched_visitor is None:
+                    for prev_ep, prev_vid, prev_emb in self.engine.recent_auto_enrolled:
+                        if (now_epoch - prev_ep) <= 60.0:
+                            if cosine_sim(emb, prev_emb) >= 0.40:
+                                if prev_vid in self.engine.unique_cache_by_id:
+                                    matched_visitor = self.engine.unique_cache_by_id[prev_vid]
+                                    break
 
             # Registration or Update
             if matched_visitor is None:
@@ -911,10 +982,18 @@ class CameraStreamPipeline:
                     visitor_id = "UNTRACKED_EXIT"
                     gender = instant_gender or 'male'
                     age = age or 28
+                elif not getattr(self.engine, 'auto_enroll_enabled', True):
+                    # AUTO-ENROLLMENT PAUSED/STOPPED:
+                    # Do NOT create new employee profile or add to gallery/database!
+                    # We only match & track existing enrolled/auto-enrolled profiles.
+                    visitor_id = "UNREGISTERED"
+                    gender = instant_gender or 'male'
+                    age = age or 28
                 else:
                     # ENTRY / CHECKPOINT CAMERA: Normal New Visitor / Staff Auto-Enrollment
-                    # Reject low-level noise while reliably capturing incoming staff faces
-                    if det_score < 0.45 or w < 18 or h < 22:
+                    # High-confidence gate for creating a BRAND NEW employee profile
+                    # Rejects low-confidence noise & floor textures (det_score 0.51)
+                    if det_score < 0.65 or w < 32 or h < 38:
                         continue
 
                     if matched_blacklist is not None and matched_blacklist.get('alias'):
@@ -923,6 +1002,10 @@ class CameraStreamPipeline:
                         visitor_id = matched_blacklist['id']
                     else:
                         visitor_id = self.engine.get_next_employee_id()
+                    self.engine.recent_auto_enrolled.append((now_epoch, visitor_id, emb))
+                    if not hasattr(self.engine, 'recent_auto_enrolled_locs'):
+                        self.engine.recent_auto_enrolled_locs = collections.deque(maxlen=40)
+                    self.engine.recent_auto_enrolled_locs.append((now_epoch, visitor_id, emb, self.camera_id, cx, cy))
 
                     init_gender = instant_gender or 'male'
                     init_conf = gender_conf if instant_gender else 0.70
@@ -961,6 +1044,7 @@ class CameraStreamPipeline:
                     self.engine.unique_cache.append(matched_visitor)
                     self.engine.unique_cache_by_id[visitor_id] = matched_visitor
                     self.engine.add_to_gallery(matched_visitor, emb)
+                    self.engine.sighting_cooldowns[(visitor_id, self.camera_id)] = now_epoch
                     if gender_locked_flag:
                         self.engine.locked_genders.add(visitor_id)
 
@@ -986,6 +1070,7 @@ class CameraStreamPipeline:
                     matched_visitor['db_committed'] = True
                     p_rec = matched_visitor.pop('pending_db_record', None)
                     p_sig = matched_visitor.pop('pending_sighting_record', None)
+                    self.engine.sighting_cooldowns[(visitor_id, self.camera_id)] = now_epoch
                     if p_rec:
                         self.engine.async_db_execute("""
                             INSERT INTO unique_visitors (id, gender, gender_confidence, age, embedding_json, photo_b64, crops_json, first_seen, last_seen, last_camera, is_blacklisted, blacklist_reason, gender_locked)
@@ -1022,7 +1107,7 @@ class CameraStreamPipeline:
                         matched_visitor['last_seen'] = now_iso
                         matched_visitor['last_seen_epoch'] = now_epoch
 
-                        # Broadcast transit event
+                        # Broadcast transit event with 180s cooldown
                         transit_event = {
                             'visitor_id': visitor_id,
                             'name': matched_visitor.get('name') or visitor_id,
@@ -1033,19 +1118,36 @@ class CameraStreamPipeline:
                             'photo_b64': matched_visitor.get('photo_b64', photo_b64),
                             'timestamp': get_ist_str("%I:%M:%S %p IST")
                         }
-                        self.engine._broadcast_transit(transit_event)
+                        last_tr = self.engine.transit_cooldowns.get(visitor_id, 0)
+                        if (now_epoch - last_tr) >= 180.0:
+                            self.engine.transit_cooldowns[visitor_id] = now_epoch
+                            self.engine._broadcast_transit(transit_event)
 
                         self.engine.async_db_execute("""
                             UPDATE unique_visitors
                             SET previous_camera = ?, previous_camera_name = ?, last_camera = ?, last_seen = ?
                             WHERE id = ?
                         """, (last_cam, prev_cam_name, self.camera_id, now_iso, visitor_id))
+
+                        sighting_key = (visitor_id, self.camera_id)
+                        last_sig = self.engine.sighting_cooldowns.get(sighting_key, 0)
+                        if (now_epoch - last_sig) >= 180.0:
+                            self.engine.sighting_cooldowns[sighting_key] = now_epoch
+                            self.engine.async_db_execute("""
+                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, face_b64, is_blacklisted)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (visitor_id, self.camera_id, now_iso, matched_visitor['gender'], det_score, photo_b64, face_b64, 1 if matched_visitor.get('is_blacklisted') else 0))
+                else:
+                    matched_visitor['last_camera'] = self.camera_id
+                    sighting_key = (visitor_id, self.camera_id)
+                    last_sig = self.engine.sighting_cooldowns.get(sighting_key, 0)
+                    if (now_epoch - last_sig) >= 180.0:
+                        self.engine.sighting_cooldowns[sighting_key] = now_epoch
                         self.engine.async_db_execute("""
                             INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, face_b64, is_blacklisted)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """, (visitor_id, self.camera_id, now_iso, matched_visitor['gender'], det_score, photo_b64, face_b64, 1 if matched_visitor.get('is_blacklisted') else 0))
-                else:
-                    matched_visitor['last_camera'] = self.camera_id
+
                 self.engine.record_attendance_event(visitor_id, self.camera_id, getattr(self, 'role', 'entry'), now_iso)
 
                 # Dynamic Gender Consensus & Multi-Sample Correction
@@ -1093,59 +1195,34 @@ class CameraStreamPipeline:
 
                 # EXIT CAMERA: Do NOT append exit embeddings or overwrite avatar with exit frames!
                 if not is_exit_camera:
-                    # Dynamic clear crop accumulation & avatar upgrading (Entry only)
                     crops = matched_visitor.get('crops', [])
                     if not isinstance(crops, list):
                         crops = [crops] if crops else []
-                    existing_quality = matched_visitor.get('best_quality', 0.0)
 
-                    if photo_b64 and is_sharp and quality_score >= 30.0 and det_score >= 0.75:
-                        current_photo = matched_visitor.get('photo_b64', '')
-                        is_old_face_only = len(current_photo) < 9000
-                        # If profile already has 8 crops or is locked, stop adding/replacing crops aggressively!
-                        if (len(crops) >= 8 or matched_visitor.get('gender_locked')) and not is_old_face_only:
-                            pass  # Crops and embeddings are fully stabilized. Do not add more!
-                        elif is_old_face_only or quality_score > existing_quality or not matched_visitor.get('photo_b64'):
-                            matched_visitor['photo_b64'] = photo_b64  # Upper body / torso photo
-                            matched_visitor['best_quality'] = quality_score
-                            if face_b64 and face_b64 in crops:
-                                crops.remove(face_b64)
-                            if face_b64:
-                                crops.insert(0, face_b64)
-                            matched_visitor['crops'] = crops[:8]
-                            matched_visitor['embedding'] = emb
-                            if 'embeddings' not in matched_visitor or not matched_visitor['embeddings']:
-                                matched_visitor['embeddings'] = [emb]
-                            else:
-                                matched_visitor['embeddings'][0] = emb
-                            self.engine.async_db_execute('UPDATE unique_visitors SET photo_b64 = ?, crops_json = ?, embedding_json = ?, last_seen = ? WHERE id = ?',
-                                                         (photo_b64, json.dumps(crops[:8]), json.dumps(emb.tolist()), now_iso, visitor_id))
-                        elif len(crops) < 8 and quality_score >= 35.0 and det_score >= 0.78:
-                            # Dynamic embedding limit (min 2-3 clear samples, max 8)
-                            # Only add genuine diverse views (sim 0.60 to 0.88 — raised from 0.52 to avoid mixing)
-                            # COOLDOWN: Don't add new crop for the same visitor more than once per 20 seconds
-                            # Prevents stationary guards/receptionists from flooding the gallery matrix
-                            last_crop_epoch = matched_visitor.get('last_crop_epoch', 0)
-                            crop_cooldown_ok = (now_epoch - last_crop_epoch) >= 20.0
-                            vis_embs = matched_visitor.get('embeddings', [matched_visitor.get('embedding')])
-                            sims = [cosine_sim(emb, ve) for ve in vis_embs if ve is not None]
-                            max_sim = max(sims) if sims else 0.0
-                            # CAP: Max 5 embeddings per visitor in gallery matrix (crops can still reach 8)
-                            gallery_emb_count = len([e for e in vis_embs if e is not None])
-                            if crop_cooldown_ok and 0.60 <= max_sim <= 0.88 and gallery_emb_count < 5:
-                                if face_b64:
-                                    crops.append(face_b64)
-                                else:
-                                    crops.append(photo_b64)
+                    vis_embs = matched_visitor.get('embeddings', [matched_visitor.get('embedding')])
+                    vis_embs = [ve for ve in vis_embs if ve is not None]
+                    anchor_emb = vis_embs[0] if vis_embs else matched_visitor.get('embedding')
+
+                    # STRICT BIOMETRIC PURITY GATE:
+                    # New crop/avatar MUST match the visitor's anchor embedding >= 0.65!
+                    # If this condition is not met, this frame MUST NOT pollute this profile's crops or embeddings!
+                    biometric_pure = (anchor_emb is not None and cosine_sim(emb, anchor_emb) >= 0.65)
+
+                    if biometric_pure and photo_b64 and is_sharp and quality_score >= 32.0 and det_score >= 0.78:
+                        last_crop_epoch = matched_visitor.get('last_crop_epoch', 0)
+                        crop_cooldown_ok = (now_epoch - last_crop_epoch) >= 20.0
+                        if crop_cooldown_ok and len(crops) < 8:
+                            if face_b64 and face_b64 not in crops:
+                                crops.append(face_b64)
                                 matched_visitor['crops'] = crops[:8]
-                                if 'embeddings' not in matched_visitor or not matched_visitor['embeddings']:
-                                    matched_visitor['embeddings'] = [emb]
-                                else:
-                                    matched_visitor['embeddings'].append(emb)
                                 matched_visitor['last_crop_epoch'] = now_epoch
-                                self.engine.add_to_gallery(matched_visitor, emb)
-                                self.engine.async_db_execute('UPDATE unique_visitors SET crops_json = ?, last_seen = ? WHERE id = ?',
-                                                             (json.dumps(crops[:8]), now_iso, visitor_id))
+                                if len(vis_embs) < 5:
+                                    matched_visitor['embeddings'].append(emb)
+                                    self.engine.add_to_gallery(matched_visitor, emb)
+                                self.engine.async_db_execute(
+                                    'UPDATE unique_visitors SET crops_json = ?, last_seen = ? WHERE id = ?',
+                                    (json.dumps(crops[:8]), now_iso, visitor_id)
+                                )
 
                 matched_visitor['last_seen'] = now_iso
                 matched_visitor['last_seen_epoch'] = now_epoch
@@ -1312,6 +1389,10 @@ class CameraStreamPipeline:
                 else:
                     tag = f"{t_vid} [CHECKED OUT]"
                 tag_bg = (30, 80, 150)
+            elif t_vid == 'UNREGISTERED':
+                color = (150, 150, 150)  # Neutral Silver
+                tag = "UNREGISTERED [AUTO-ENROLL STOPPED]"
+                tag_bg = (50, 50, 50)
             elif t_transit:
                 color = (46, 204, 113)  # Emerald Green (Verified Transit)
                 short_prev = (t_prev or 'Entry').replace('Main Porch Entry — Inbound', 'Entry').replace('Main porch exit', 'Exit')
@@ -1380,11 +1461,24 @@ class FaceTrackerEngine:
         # Load AI models
         det_path = str(MODELS / 'face_detection_yunet_2023mar.onnx')
         rec_path = str(MODELS / 'face_recognition_sface_2021dec.onnx')
+        arcface_path = str(MODELS / 'w600k_mbf.onnx')
         gender_path = str(MODELS / 'genderage.onnx')
 
         self.detector = cv2.FaceDetectorYN_create(det_path, '', (960, 540), 0.45, 0.3, 1000)
         self.recognizer = cv2.FaceRecognizerSF_create(rec_path, '')
+        
+        self.arcface_sess = None
+        if os.path.exists(arcface_path):
+            try:
+                import onnxruntime as ort
+                self.arcface_sess = ort.InferenceSession(arcface_path, providers=['CPUExecutionProvider'])
+                self.arcface_input_name = self.arcface_sess.get_inputs()[0].name
+                print("ArcFace 512-d (w600k_mbf.onnx) loaded successfully into ONNX Runtime!")
+            except Exception as e:
+                print("Failed to load ArcFace ONNX model:", e)
+
         self.late_arrival_time = self._load_setting('late_arrival_time', '09:00')
+        self.auto_enroll_enabled = self._load_setting('auto_enroll_enabled', '1') in ('1', 'true', 'True', 'yes', 'on')
         
         self.gender_net = None
         if os.path.exists(gender_path):
@@ -1403,6 +1497,10 @@ class FaceTrackerEngine:
         self.dismissed_targets = set()
         self.gender_votes = {}
         self.blacklist_sighting_history = {}
+        self.attendance_cooldowns = {}
+        self.sighting_cooldowns = {}
+        self.transit_cooldowns = {}
+        self.recent_auto_enrolled = collections.deque(maxlen=30)
 
         # Vectorized acceleration matrices
         self.gallery_matrix = None
@@ -1528,6 +1626,8 @@ class FaceTrackerEngine:
             conn.close()
             if key == 'late_arrival_time':
                 self.late_arrival_time = str(value).strip()
+            elif key == 'auto_enroll_enabled':
+                self.auto_enroll_enabled = str(value).strip().lower() in ('1', 'true', 'yes', 'on')
             return True
         except Exception as e:
             return False
@@ -1578,10 +1678,47 @@ class FaceTrackerEngine:
                 faces[i][landmark_idx + 1] *= scale_y
         return faces
 
+    ARCFACE_DST = np.array([
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041]
+    ], dtype=np.float32)
+
     def _extract_embedding(self, frame: np.ndarray, face: np.ndarray):
+        # 1. Primary: 512-dimensional ArcFace Deep Metric Inference
+        if getattr(self, 'arcface_sess', None) is not None and len(face) >= 14:
+            try:
+                pts = np.array([
+                    [face[4], face[5]],
+                    [face[6], face[7]],
+                    [face[8], face[9]],
+                    [face[10], face[11]],
+                    [face[12], face[13]]
+                ], dtype=np.float32)
+                tform, _ = cv2.estimateAffinePartial2D(pts, self.ARCFACE_DST)
+                if tform is not None:
+                    warped = cv2.warpAffine(frame, tform, (112, 112), borderValue=0.0)
+                    blob = (warped.astype(np.float32) - 127.5) / 127.5
+                    blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+                    with self.inference_lock:
+                        out = self.arcface_sess.run(None, {self.arcface_input_name: blob})[0][0]
+                    norm = np.linalg.norm(out)
+                    if norm > 1e-6:
+                        return (out / norm).astype(np.float32)
+            except Exception:
+                pass
+
+        # 2. Fallback: 128-dimensional SFace
         with self.inference_lock:
             aligned = self.recognizer.alignCrop(frame, face)
             feature = self.recognizer.feature(aligned)
+            if feature is not None:
+                feat = feature.flatten().astype(np.float32)
+                norm = np.linalg.norm(feat)
+                if norm > 1e-6:
+                    return feat / norm
         return feature.astype(np.float32)
 
     def _is_sharp_face_crop(self, face_crop: np.ndarray, face_coords: np.ndarray, det_score: float):
@@ -1593,8 +1730,8 @@ class FaceTrackerEngine:
             return False, 0.0
 
         x, y, w, h = [int(v) for v in face_coords[:4]]
-        # Minimum resolution: 18x22 to ensure valid biometric discriminability
-        if w < 18 or h < 22:
+        # Minimum resolution: 28x34 to ensure valid biometric discriminability & clear human verification
+        if w < 28 or h < 34:
             return False, 0.0
 
         aspect = float(w) / max(float(h), 1.0)
@@ -1913,20 +2050,6 @@ class FaceTrackerEngine:
                     'last_camera': r[9] if len(r) > 9 else 'main',
                     'previous_camera': r[10] if len(r) > 10 else None
                 }
-                # Also index into watchlist_cache if enrolled staff with name
-                if enr and r_name and not any(w.get('alias') == vis_id or w.get('id') == vis_id for w in self.watchlist_cache):
-                    self.watchlist_cache.append({
-                        'id': f"STAFF-{vis_id}",
-                        'name': r_name,
-                        'alias': vis_id,
-                        'category': dept,
-                        'reason': f"Registered Staff - {desig}",
-                        'embedding': emb,
-                        'embeddings': vis_embeddings,
-                        'photo_b64': r[4],
-                        'crops': crops,
-                        'enrolled_at': r[3] or get_ist_iso()
-                    })
                 self.unique_cache.append(vis_obj)
                 self.unique_cache_by_id[vis_id] = vis_obj
 
@@ -2056,6 +2179,7 @@ class FaceTrackerEngine:
 
     def rebuild_gallery_index(self):
         with self.matrix_lock:
+            expected_dim = 512 if getattr(self, 'arcface_sess', None) is not None else 128
             rows = []
             idx = []
             for vis in self.unique_cache:
@@ -2063,6 +2187,8 @@ class FaceTrackerEngine:
                 for e in embs:
                     if e is not None:
                         ef = np.asarray(e, dtype=np.float32).flatten()
+                        if len(ef) != expected_dim:
+                            continue
                         norm = np.linalg.norm(ef)
                         if norm > 1e-6:
                             rows.append(ef / norm)
@@ -2076,6 +2202,7 @@ class FaceTrackerEngine:
 
     def rebuild_watchlist_index(self):
         with self.matrix_lock:
+            expected_dim = 512 if getattr(self, 'arcface_sess', None) is not None else 128
             rows = []
             idx = []
             for bl in self.watchlist_cache:
@@ -2083,6 +2210,8 @@ class FaceTrackerEngine:
                 for e in embs:
                     if e is not None:
                         ef = np.asarray(e, dtype=np.float32).flatten()
+                        if len(ef) != expected_dim:
+                            continue
                         norm = np.linalg.norm(ef)
                         if norm > 1e-6:
                             rows.append(ef / norm)
@@ -2094,7 +2223,7 @@ class FaceTrackerEngine:
                 self.watchlist_matrix = None
                 self.watchlist_index = []
 
-    def search_gallery(self, emb: np.ndarray, threshold: float = 0.52, recent_threshold: float = 0.48, recent_seconds: float = 900.0, query_gender: str = None, gender_conf: float = 0.0):
+    def search_gallery(self, emb: np.ndarray, threshold: float = 0.63, recent_threshold: float = 0.62, recent_seconds: float = 900.0, query_gender: str = None, gender_conf: float = 0.0, is_exit: bool = False):
         with self.matrix_lock:
             if self.gallery_matrix is None or len(self.gallery_index) == 0:
                 return None, 0.0
@@ -2108,43 +2237,86 @@ class FaceTrackerEngine:
                 return None, 0.0
 
             now_epoch = time.time()
-            top_k_indices = np.argsort(sims)[::-1][:15]
+            top_k_indices = np.argsort(sims)[::-1][:20]
 
-            # 1. Temporal Corridor Priority: If seen nearby in recent_seconds (15 mins), match with corridor threshold (0.48)
-            # This ensures walking visitors maintain continuous identity and do not fragment into multiple IDs
+            # -----------------------------------------------------------------
+            # TIER 1: ENROLLED HOSPITAL STAFF PRIORITY (512-d ArcFace)
+            # Doctors, consultants, nurses, and registered personnel.
+            # Verified enrolled staff have highest priority.
+            # -----------------------------------------------------------------
+            best_enrolled_vis = None
+            best_enrolled_sim = 0.0
+            for idx in top_k_indices:
+                sim = float(sims[idx])
+                vis = self.gallery_index[idx]
+                if not vis.get('is_enrolled'):
+                    continue
+                # If on exit camera, staff member must currently be present/checked-in today!
+                if is_exit and vis.get('today_status') != 'in_hospital' and not vis.get('today_check_in'):
+                    continue
+                cand_gender = vis.get('gender')
+                if query_gender and cand_gender and vis.get('gender_locked') and cand_gender != query_gender:
+                    continue
+                effective_enr_th = 0.65 if is_exit else 0.60
+                if sim >= effective_enr_th and sim > best_enrolled_sim:
+                    best_enrolled_vis = vis
+                    best_enrolled_sim = sim
+
+            if best_enrolled_vis is not None:
+                return best_enrolled_vis, best_enrolled_sim
+
+            # -----------------------------------------------------------------
+            # EXIT CAMERA: If no enrolled staff matched, require strict
+            # confidence (>= 0.66) before matching any auto-enrolled visitor!
+            # Must also currently be in_hospital with an established check-in today!
+            # -----------------------------------------------------------------
+            if is_exit:
+                for idx in top_k_indices:
+                    sim = float(sims[idx])
+                    if sim < 0.66:
+                        break
+                    vis = self.gallery_index[idx]
+                    # Strictly require active check-in today: strangers exiting cannot check out absent people
+                    if vis.get('today_status') != 'in_hospital' and not vis.get('today_check_in'):
+                        continue
+                    cand_gender = vis.get('gender')
+                    if query_gender and cand_gender and vis.get('gender_locked') and cand_gender != query_gender:
+                        continue
+                    return vis, sim
+                return None, 0.0
+
+            # -----------------------------------------------------------------
+            # TIER 2: AUTO-ENROLLED PROFILES (ENTRY / INBOUND ONLY)
+            # -----------------------------------------------------------------
+            # 1. Temporal Corridor Priority: If seen nearby in recent_seconds (15 mins), match with corridor threshold
             for idx in top_k_indices:
                 sim = float(sims[idx])
                 if sim < recent_threshold:
                     break
                 vis = self.gallery_index[idx]
 
-                # Gender Consistency Guard:
-                # If query is confident (gender_conf >= 0.70) and candidate visitor has an established/locked gender
-                # that contradicts the query, do NOT match! (Prevents walking males from merging into female guard)
                 cand_gender = vis.get('gender')
-                if query_gender and cand_gender and gender_conf >= 0.70:
-                    if cand_gender != query_gender and (vis.get('gender_locked') or vis.get('gender_confidence', 0) >= 0.75):
-                        continue
+                if query_gender and cand_gender and vis.get('gender_locked') and cand_gender != query_gender:
+                    continue
 
                 last_seen_epoch = vis.get('last_seen_epoch', 0)
                 if (now_epoch - last_seen_epoch) <= recent_seconds:
                     return vis, sim
 
-            # 2. General Historical Gallery Match: Requires strict threshold (0.52)
+            # 2. General Historical Gallery Match: Requires strict threshold (0.63)
             for idx in top_k_indices:
                 sim = float(sims[idx])
                 if sim < threshold:
                     break
                 vis = self.gallery_index[idx]
                 cand_gender = vis.get('gender')
-                if query_gender and cand_gender and gender_conf >= 0.70:
-                    if cand_gender != query_gender and (vis.get('gender_locked') or vis.get('gender_confidence', 0) >= 0.75):
-                        continue
+                if query_gender and cand_gender and vis.get('gender_locked') and cand_gender != query_gender:
+                    continue
                 return vis, sim
 
             return None, 0.0
 
-    def search_watchlist(self, emb: np.ndarray, threshold: float = 0.50):
+    def search_watchlist(self, emb: np.ndarray, threshold: float = 0.60):
         with self.matrix_lock:
             if self.watchlist_matrix is None or len(self.watchlist_index) == 0:
                 return None, 0.0
@@ -2165,7 +2337,10 @@ class FaceTrackerEngine:
         Hard cap: max 5 matrix rows per visitor (prevents stationary-person flooding).
         """
         with self.matrix_lock:
+            expected_dim = 512 if getattr(self, 'arcface_sess', None) is not None else 128
             ef = np.asarray(emb, dtype=np.float32).flatten()
+            if len(ef) != expected_dim:
+                return
             norm = np.linalg.norm(ef)
             if norm > 1e-6:
                 # Count existing rows for this visitor
@@ -2173,7 +2348,7 @@ class FaceTrackerEngine:
                 existing_count = sum(1 for v in self.gallery_index if v.get('id') == vis_id)
                 if existing_count >= 5:
                     return  # Already at cap — do not add more rows for this person
-                row = (ef / norm).reshape(1, 128)
+                row = (ef / norm).reshape(1, expected_dim)
                 if self.gallery_matrix is not None:
                     self.gallery_matrix = np.vstack([self.gallery_matrix, row])
                     self.gallery_index.append(vis)
@@ -2185,10 +2360,10 @@ class FaceTrackerEngine:
     def get_next_employee_id(self):
         with self.matrix_lock:
             max_num = 0
-            for emp_id in self.unique_cache_by_id.keys():
-                if emp_id.startswith('EMP'):
+            for emp_id, v in self.unique_cache_by_id.items():
+                if str(emp_id).startswith('EMP'):
                     try:
-                        clean = emp_id.replace('EMP-', '').replace('EMP', '')
+                        clean = str(emp_id).replace('EMP-', '').replace('EMP', '')
                         num = int(clean)
                         if num > max_num:
                             max_num = num
@@ -2200,7 +2375,7 @@ class FaceTrackerEngine:
                 cur.execute("SELECT id FROM unique_visitors WHERE id LIKE 'EMP%'")
                 for (r_id,) in cur.fetchall():
                     try:
-                        clean = r_id.replace('EMP-', '').replace('EMP', '')
+                        clean = str(r_id).replace('EMP-', '').replace('EMP', '')
                         n = int(clean)
                         if n > max_num:
                             max_num = n
@@ -2213,18 +2388,56 @@ class FaceTrackerEngine:
             return f"EMP-{next_num:03d}"
 
     def record_attendance_event(self, employee_id: str, camera_id: str, camera_role: str, timestamp_iso: str):
-        if not employee_id or employee_id == 'UNTRACKED_EXIT':
+        if not employee_id or employee_id in ('UNTRACKED_EXIT', 'UNREGISTERED'):
             return
+        now_ep = time.time()
         date_str = timestamp_iso.split('T')[0] if 'T' in timestamp_iso else get_ist_iso().split('T')[0]
         cam_info = CAMERA_SOURCES.get(camera_id, {})
         cam_name = cam_info.get('name', camera_id)
         crole = str(camera_role or cam_info.get('role', 'entry')).lower()
         is_exit = (crole == 'exit') or ('exit' in camera_id.lower()) or ('exit' in cam_name.lower()) or ('checkout' in camera_id.lower())
 
-        # Update in-memory profile
-        if employee_id in self.unique_cache_by_id:
-            v = self.unique_cache_by_id[employee_id]
+        v = self.unique_cache_by_id.get(employee_id)
+        if v:
             v['last_seen'] = timestamp_iso
+            v['last_camera'] = camera_id
+
+        # MINIMUM DWELL & CHECK-IN GUARD: Prevent spurious checkout without prior check-in!
+        if is_exit:
+            if not v:
+                return
+            if v.get('today_status') == 'checked_out':
+                return  # Already checked out today! Locked.
+            ref_in_time = v.get('last_in_time') or v.get('today_check_in')
+            if not ref_in_time:
+                return  # Never checked in today -> cannot check out!
+            try:
+                dt_in = datetime.fromisoformat(ref_in_time)
+                dt_now = datetime.fromisoformat(timestamp_iso)
+                dwell_seconds = (dt_now - dt_in).total_seconds()
+                # A person must be on-site for at least 120 seconds before check-out can be recorded!
+                if dwell_seconds < 120.0:
+                    return
+            except Exception:
+                return
+
+        # COOLDOWN CHECK: Avoid re-writing DB on every single frame!
+        cooldown_key = (employee_id, 'exit' if is_exit else 'entry')
+        last_rec = self.attendance_cooldowns.get(cooldown_key, 0)
+
+        if not is_exit:
+            # If already marked in_hospital today and logged within 300s, do not commit redundant DB update
+            if v and v.get('today_status') == 'in_hospital' and (now_ep - last_rec) < 300.0:
+                return
+        else:
+            # If already marked checked_out today, lock check-out permanently for shift
+            if v and v.get('today_status') == 'checked_out':
+                return
+
+        self.attendance_cooldowns[cooldown_key] = now_ep
+
+        # Update in-memory profile
+        if v:
             if is_exit:
                 v['today_status'] = 'checked_out'
                 v['today_check_out'] = timestamp_iso
@@ -2236,6 +2449,7 @@ class FaceTrackerEngine:
                     v['today_check_in'] = timestamp_iso
                     v['today_check_in_camera'] = camera_id
                     v['today_check_in_camera_name'] = cam_name
+                v['last_in_time'] = timestamp_iso
                 v['today_status'] = 'in_hospital'
                 v['is_checkout_verified'] = False
 
@@ -2246,10 +2460,14 @@ class FaceTrackerEngine:
             cur.execute("SELECT id, check_in_time, check_out_time, sightings_count, cameras_visited FROM daily_attendance WHERE employee_id = ? AND date = ?", (employee_id, date_str))
             row = cur.fetchone()
             if not row:
+                if is_exit:
+                    # An exit camera CANNOT fabricate a check-in!
+                    conn.close()
+                    return
                 in_time = timestamp_iso
-                out_time = timestamp_iso if is_exit else None
-                status = 'checked_out' if is_exit else 'in_hospital'
-                is_ver = 1 if is_exit else 0
+                out_time = None
+                status = 'in_hospital'
+                is_ver = 0
                 dur = 0
                 cur.execute("""
                     INSERT INTO daily_attendance (
@@ -2258,7 +2476,7 @@ class FaceTrackerEngine:
                         duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 """, (employee_id, date_str, in_time, camera_id, cam_name,
-                      out_time, camera_id if is_exit else None, cam_name if is_exit else None,
+                      None, None, None,
                       dur, status, is_ver, camera_id))
             else:
                 rec_id, ex_in, ex_out, scnt, cams_v = row
@@ -2297,7 +2515,7 @@ class FaceTrackerEngine:
             conn.commit()
             conn.close()
         except Exception as e:
-            pass
+            print("[ATTENDANCE RECORD ERROR]:", e)
 
     def get_employee_30d_stats(self, employee_id: str):
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
@@ -2555,7 +2773,8 @@ class FaceTrackerEngine:
             for s in staff_list:
                 # Synthetic unit-normalized embedding for each staff member
                 rng = np.random.RandomState(abs(hash(s['id'])) % (2**31))
-                syn_emb = rng.randn(128).astype(np.float32)
+                dim = 512 if getattr(self, 'arcface_sess', None) is not None else 128
+                syn_emb = rng.randn(dim).astype(np.float32)
                 syn_emb = syn_emb / np.linalg.norm(syn_emb)
                 emb_json = json.dumps(syn_emb.tolist())
 
@@ -2774,34 +2993,9 @@ class FaceTrackerEngine:
                 self.unique_cache.insert(0, prof)
                 self.unique_cache_by_id[target_id] = prof
 
-            # Update or insert into watchlist_cache (enrolled staff index)
-            existing_bl = next((w for w in self.watchlist_cache if w.get('alias') == target_id or w.get('id') == target_id), None)
-            if existing_bl:
-                existing_bl['name'] = target_name
-                existing_bl['category'] = department
-                existing_bl['reason'] = f"Registered Staff - {designation}"
-                if photo_b64:
-                    existing_bl['photo_b64'] = photo_b64
-                    existing_bl['embedding'] = emb
-                    existing_bl['embeddings'] = [emb]
-            else:
-                self.watchlist_cache.append({
-                    'id': f"STAFF-{target_id}",
-                    'name': target_name,
-                    'alias': target_id,
-                    'category': department,
-                    'reason': f"Registered Staff - {designation}",
-                    'embedding': emb,
-                    'embeddings': [emb],
-                    'photo_b64': photo_b64,
-                    'crops': crops,
-                    'enrolled_at': now_iso
-                })
-
             self.rebuild_gallery_index()
-            self.rebuild_watchlist_index()
 
-        # Database persistence: ALWAYS set is_enrolled = 1
+        # Database persistence: ALWAYS set is_enrolled = 1 (Never pollute blacklist_watchlist)
         self._safe_db_write([
             ("""
                 INSERT INTO unique_visitors (
@@ -2818,12 +3012,7 @@ class FaceTrackerEngine:
                     embedding_json = CASE WHEN excluded.embedding_json IS NOT NULL THEN excluded.embedding_json ELSE unique_visitors.embedding_json END,
                     enrollment_date = excluded.enrollment_date,
                     last_seen = excluded.last_seen
-            """, (target_id, target_id, target_name, department, designation, emb_json, photo_b64, crops_json, now_iso, now_iso, now_iso)),
-            ("""
-                INSERT OR REPLACE INTO blacklist_watchlist (
-                    id, name, alias, category, reason, embedding_json, photo_b64, crops_json, enrolled_at, enrolled_by, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'HR Admin', 1)
-            """, (f"STAFF-{target_id}", target_name, target_id, department, f"Registered Staff - {designation}", emb_json, photo_b64, crops_json, now_iso))
+            """, (target_id, target_id, target_name, department, designation, emb_json, photo_b64, crops_json, now_iso, now_iso, now_iso))
         ])
 
         clean_prof = {k: v for k, v in prof.items() if k not in ('embedding', 'embeddings')}
@@ -3548,7 +3737,8 @@ class FaceTrackerEngine:
         cur = conn.cursor()
         cur.execute('DELETE FROM unique_visitors WHERE id = ?', (visitor_id,))
         cur.execute('DELETE FROM visitor_sightings WHERE visitor_id = ?', (visitor_id,))
-        cur.execute('DELETE FROM blacklist_watchlist WHERE alias = ?', (visitor_id,))
+        cur.execute('DELETE FROM blacklist_watchlist WHERE alias = ? OR id = ?', (visitor_id, visitor_id))
+        cur.execute('DELETE FROM daily_attendance WHERE employee_id = ?', (visitor_id,))
         conn.commit()
         conn.close()
 
@@ -3557,7 +3747,27 @@ class FaceTrackerEngine:
             del self.unique_cache_by_id[visitor_id]
         self.blacklisted_visitor_ids.discard(visitor_id)
         self.locked_genders.discard(visitor_id)
+        self.rebuild_gallery_index()
+        self.rebuild_watchlist_index()
         return True, "Visitor deleted"
+
+    def delete_all_auto_enrolled(self):
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM unique_visitors WHERE is_enrolled = 0')
+        auto_ids = [r[0] for r in cur.fetchall()]
+        if auto_ids:
+            placeholders = ','.join(['?'] * len(auto_ids))
+            cur.execute(f'DELETE FROM unique_visitors WHERE id IN ({placeholders})', auto_ids)
+            cur.execute(f'DELETE FROM visitor_sightings WHERE visitor_id IN ({placeholders})', auto_ids)
+            cur.execute(f'DELETE FROM daily_attendance WHERE employee_id IN ({placeholders})', auto_ids)
+        conn.commit()
+        conn.close()
+
+        self.unique_cache = [v for v in self.unique_cache if v.get('is_enrolled')]
+        self.unique_cache_by_id = {k: v for k, v in self.unique_cache_by_id.items() if v.get('is_enrolled')}
+        self.rebuild_gallery_index()
+        return True, f"Deleted {len(auto_ids)} auto-enrolled profiles"
 
     def toggle_visitor_gender(self, visitor_id: str, new_gender: str):
         new_g = str(new_gender).strip().lower()
@@ -3913,6 +4123,7 @@ class FaceTrackerEngine:
             'late_arrivals_percent': late_pct,
             'late_arrival_time': self.late_arrival_time,
             'late_arrival_display': self._format_time_display(self.late_arrival_time),
+            'auto_enroll_enabled': getattr(self, 'auto_enroll_enabled', True),
             'avg_active_time_str': avg_active_time_str,
             'avg_active_diff_str': avg_active_diff_str,
             'avg_daily_time_30d': avg_30d_time_str,
@@ -4478,7 +4689,8 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
         if path == '/api/settings':
             return self.send_json(200, {
                 'late_arrival_time': tracker.late_arrival_time,
-                'late_arrival_display': tracker._format_time_display(tracker.late_arrival_time)
+                'late_arrival_display': tracker._format_time_display(tracker.late_arrival_time),
+                'auto_enroll_enabled': getattr(tracker, 'auto_enroll_enabled', True)
             })
 
         if path in ('/api/department-attendance', '/api/departments/attendance'):
@@ -4652,19 +4864,24 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length) or b'{}') if length > 0 else {}
 
-        if path in ('/api/settings', '/api/settings/late-arrival'):
+        if path in ('/api/settings', '/api/settings/late-arrival', '/api/settings/auto-enroll'):
+            if 'auto_enroll_enabled' in body or 'enabled' in body:
+                val = body.get('enabled') if 'enabled' in body else body.get('auto_enroll_enabled')
+                tracker.set_setting('auto_enroll_enabled', '1' if val else '0')
+
             new_time = body.get('late_arrival_time') or body.get('time')
             if new_time:
                 clean_time = str(new_time).strip()
                 if len(clean_time) == 4 and ':' in clean_time:
                     clean_time = '0' + clean_time
                 tracker.set_setting('late_arrival_time', clean_time)
-                return self.send_json(200, {
-                    'status': 'success',
-                    'late_arrival_time': tracker.late_arrival_time,
-                    'late_arrival_display': tracker._format_time_display(tracker.late_arrival_time)
-                })
-            return self.send_json(400, {'error': 'Missing late_arrival_time'})
+
+            return self.send_json(200, {
+                'status': 'success',
+                'late_arrival_time': tracker.late_arrival_time,
+                'late_arrival_display': tracker._format_time_display(tracker.late_arrival_time),
+                'auto_enroll_enabled': getattr(tracker, 'auto_enroll_enabled', True)
+            })
 
         if path == '/api/employees/enroll':
             emp_id = (body.get('employee_id') or '').strip() or None
@@ -4804,14 +5021,20 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
                 return self.send_json(200, {'success': True, 'message': msg})
             return self.send_json(400, {'error': msg})
 
-        if path == '/api/visitors/delete':
-            visitor_id = body.get('visitor_id')
+        if path in ('/api/visitors/delete', '/api/employees/delete'):
+            visitor_id = body.get('visitor_id') or body.get('employee_id') or body.get('id')
             if not visitor_id:
                 return self.send_json(400, {'error': 'Missing visitor_id'})
             ok, msg = tracker.delete_visitor(visitor_id)
             if ok:
-                return self.send_json(200, {'success': True})
+                return self.send_json(200, {'success': True, 'message': msg})
             return self.send_json(400, {'error': msg})
+
+        if path in ('/api/visitors/delete-auto-enrolled', '/api/employees/delete-auto-enrolled'):
+            ok, msg = tracker.delete_all_auto_enrolled()
+            if ok:
+                return self.send_json(200, {'success': True, 'message': msg})
+            return self.send_json(500, {'error': msg})
 
         if path == '/api/visitors/merge':
             primary_id = body.get('primary_id')

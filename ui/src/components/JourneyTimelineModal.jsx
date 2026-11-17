@@ -66,7 +66,7 @@ const getNDaysAgoStr = (n) => {
   return `${y}-${m}-${day}`;
 };
 
-export default function JourneyTimelineModal({ visitorId, isOpen, onClose }) {
+export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDelete }) {
   const [journey, setJourney] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -914,21 +914,54 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose }) {
           <div style={{ fontSize: '11px', color: '#64748b' }}>
             Biometric Employee Attendance Ledger • Verified via Multi-Camera CCTV
           </div>
-          <button
-            onClick={onClose}
-            style={{
-              padding: '7px 18px',
-              borderRadius: '7px',
-              backgroundColor: '#0284c7',
-              color: '#ffffff',
-              border: 'none',
-              fontWeight: '700',
-              fontSize: '12px',
-              cursor: 'pointer'
-            }}
-          >
-            Close
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {onDelete && (
+              <button
+                type="button"
+                onClick={async () => {
+                  if (window.confirm(`Permanently delete profile ${visitorId} and all associated attendance/biometric records?`)) {
+                    await onDelete(visitorId);
+                    onClose();
+                  }
+                }}
+                style={{
+                  padding: '7px 14px',
+                  borderRadius: '7px',
+                  backgroundColor: '#fff1f2',
+                  color: '#e11d48',
+                  border: '1px solid #fecdd3',
+                  fontWeight: '700',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px'
+                }}
+                title="Permanently delete profile"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+                Delete Profile
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              style={{
+                padding: '7px 18px',
+                borderRadius: '7px',
+                backgroundColor: '#0284c7',
+                color: '#ffffff',
+                border: 'none',
+                fontWeight: '700',
+                fontSize: '12px',
+                cursor: 'pointer'
+              }}
+            >
+              Close
+            </button>
+          </div>
         </div>
       </div>
 

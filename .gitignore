@@ -44,6 +44,8 @@ backend/snapshots/
 snapshots/
 temp/
 *.tmp
+backend/scratch/
+scratch/
 
 # Sensitive keys and secrets
 .service-key

@@ -45,6 +45,8 @@ export default function App() {
   const [alerts, setAlerts] = useState([]);
   const [activeAlert, setActiveAlert] = useState(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [autoEnrollEnabled, setAutoEnrollEnabled] = useState(true);
+  const [registrySection, setRegistrySection] = useState('details');
   const [loading, setLoading] = useState(true);
 
   // Fetch KPI & status data
@@ -56,12 +58,17 @@ export default function App() {
         fetch(`/api/kpis?range=${encodeURIComponent(currentRange)}&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
         fetch(`/api/cameras?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
         fetch(`/api/traffic-trend?range=${encodeURIComponent(currentRange)}&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
-        fetch(`/api/visitors?limit=100&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/visitors?limit=250&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
         fetch(`/api/watchlist?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
         fetch(`/api/alerts?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null)
       ]);
 
-      if (kpiRes) setKpis(kpiRes);
+      if (kpiRes) {
+        setKpis(kpiRes);
+        if (typeof kpiRes.auto_enroll_enabled === 'boolean') {
+          setAutoEnrollEnabled(kpiRes.auto_enroll_enabled);
+        }
+      }
       if (camRes?.cameras) {
         setCameras(camRes.cameras);
         if (camRes.active) setActiveCamera(camRes.active);
@@ -485,6 +492,34 @@ export default function App() {
     }
   };
 
+  const handleOpenWatchlist = () => {
+    setRegistrySection('watchlist');
+    const el = document.getElementById('employee-registry-section');
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
+  const handleToggleAutoEnroll = async () => {
+    const nextVal = !autoEnrollEnabled;
+    setAutoEnrollEnabled(nextVal);
+    try {
+      const res = await fetch('/api/settings/auto-enroll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: nextVal })
+      });
+      const data = await res.json();
+      if (data && typeof data.auto_enroll_enabled === 'boolean') {
+        setAutoEnrollEnabled(data.auto_enroll_enabled);
+      }
+      fetchData();
+    } catch (e) {
+      console.error("Toggle auto-enroll error:", e);
+      setAutoEnrollEnabled(!nextVal);
+    }
+  };
+
   return (
     <div style={{ minHeight: '100vh', padding: '24px 32px', maxWidth: '1720px', margin: '0 auto' }}>
       {/* Tactical Threat Alert Floating Card */}
@@ -499,6 +534,7 @@ export default function App() {
         visitorId={selectedJourneyId}
         isOpen={Boolean(selectedJourneyId)}
         onClose={() => setSelectedJourneyId(null)}
+        onDelete={handleDeleteProfile}
         onBlacklist={(vid) => {
           handleBlacklist(vid, null, 'Flagged from Journey Audit');
         }}
@@ -609,6 +645,40 @@ export default function App() {
             <span>{soundEnabled ? '🔔 Sound ON' : '🔕 Sound OFF'}</span>
           </button>
 
+          {/* Auto-Enrollment Stop/Resume Global Control */}
+          <button
+            type="button"
+            onClick={handleToggleAutoEnroll}
+            title={autoEnrollEnabled ? "Auto-Enrollment is Active. Click to Stop creating new profiles." : "Auto-Enrollment is Stopped. Only existing profiles are checked. Click to Resume."}
+            style={{
+              padding: '7px 14px',
+              borderRadius: '8px',
+              backgroundColor: autoEnrollEnabled ? '#ecfdf5' : '#fef2f2',
+              border: `1.5px solid ${autoEnrollEnabled ? '#10b981' : '#ef4444'}`,
+              color: autoEnrollEnabled ? '#065f46' : '#991b1b',
+              fontSize: '12px',
+              fontWeight: '800',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '7px',
+              cursor: 'pointer',
+              boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+              transition: 'all 0.15s ease'
+            }}
+          >
+            <span style={{
+              width: '8px',
+              height: '8px',
+              borderRadius: '50%',
+              backgroundColor: autoEnrollEnabled ? '#10b981' : '#ef4444',
+              boxShadow: `0 0 6px ${autoEnrollEnabled ? '#10b981' : '#ef4444'}`
+            }}></span>
+            <span>{autoEnrollEnabled ? '⚡ Auto-Enroll: ACTIVE' : '⏸️ Auto-Enroll: STOPPED'}</span>
+            <span style={{ fontSize: '11px', opacity: 0.85, fontWeight: '600' }}>
+              {autoEnrollEnabled ? '(Click to Stop)' : '(Existing Only)'}
+            </span>
+          </button>
+
           {/* Test Movie Alert Button */}
           <button
             type="button"
@@ -676,6 +746,8 @@ export default function App() {
             viewMode={viewMode}
             onViewModeChange={setViewMode}
             onDataRefresh={fetchData}
+            watchlistCount={watchlist.length}
+            onOpenWatchlist={handleOpenWatchlist}
           />
           <TrafficTrendChart
             trendData={trendData}
@@ -703,6 +775,8 @@ export default function App() {
             viewMode={viewMode}
             onViewModeChange={setViewMode}
             onDataRefresh={fetchData}
+            watchlistCount={watchlist.length}
+            onOpenWatchlist={handleOpenWatchlist}
           />
           <TrafficTrendChart
             trendData={trendData}
@@ -720,6 +794,15 @@ export default function App() {
         visitors={visitors}
         onDataRefresh={fetchData}
         onSelectEmployee={(id) => setSelectedJourneyId(id)}
+        autoEnrollEnabled={autoEnrollEnabled}
+        onToggleAutoEnroll={handleToggleAutoEnroll}
+        watchlist={watchlist}
+        onBlacklist={handleBlacklist}
+        onRemoveBlacklist={handleRemoveBlacklist}
+        onEnrollManual={handleEnrollManual}
+        onDeleteEmployee={handleDeleteProfile}
+        activeSectionProp={registrySection}
+        onSectionChange={setRegistrySection}
       />
     </div>
   );

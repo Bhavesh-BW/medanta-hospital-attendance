@@ -25,9 +25,170 @@ const fmtTime = (ts) => {
   } catch { return '—'; }
 };
 
-export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelectEmployee }) {
-  // Top Tabs: 'details' (Employee Details) | 'absent' (Absent from Premises)
-  const [activeSection, setActiveSection] = useState('details');
+export default function EmployeeRegistry({
+  visitors = [],
+  onDataRefresh,
+  onSelectEmployee,
+  autoEnrollEnabled = true,
+  onToggleAutoEnroll,
+  watchlist = [],
+  onBlacklist,
+  onRemoveBlacklist,
+  onEnrollManual,
+  onDeleteEmployee,
+  activeSectionProp,
+  onSectionChange
+}) {
+  // Top Tabs: 'details' (Employee Details) | 'absent' (Absent from Premises) | 'auto_enroll' (Auto-Enrolled Profiles) | 'watchlist' (Security Watchlist)
+  const [activeSection, setActiveSection] = useState(activeSectionProp || 'details');
+  useEffect(() => {
+    if (activeSectionProp) {
+      setActiveSection(activeSectionProp);
+    }
+  }, [activeSectionProp]);
+
+  const switchSection = (sec) => {
+    setActiveSection(sec);
+    if (onSectionChange) onSectionChange(sec);
+  };
+
+  const autoEnrolledStaff = useMemo(() => {
+    return visitors.filter(v => !v.is_enrolled);
+  }, [visitors]);
+
+  const enrolledStaffCount = useMemo(() => {
+    return visitors.filter(v => Boolean(v.is_enrolled)).length;
+  }, [visitors]);
+
+  const watchlistIds = useMemo(() => {
+    const s = new Set();
+    (watchlist || []).forEach(w => {
+      if (w.id) s.add(String(w.id).toLowerCase());
+      if (w.alias) s.add(String(w.alias).toLowerCase());
+    });
+    return s;
+  }, [watchlist]);
+
+  const combinedWatchlist = useMemo(() => {
+    const list = [...(watchlist || [])];
+    const seenIds = new Set(list.map(w => String(w.alias || w.id || '').toLowerCase()));
+    
+    visitors.forEach(v => {
+      if (v.is_blacklisted && v.id && !seenIds.has(String(v.id).toLowerCase())) {
+        seenIds.add(String(v.id).toLowerCase());
+        list.push({
+          id: `BLK-${v.id}`,
+          alias: v.id,
+          name: v.name || v.display_name || v.id,
+          category: v.department || 'General Staff',
+          reason: v.blacklist_reason || 'Security Watchlist Notification',
+          photo_b64: v.photo_b64 || (v.crops && v.crops[0]) || null,
+          crops: v.crops || [],
+          enrolled_at: v.last_seen || new Date().toISOString()
+        });
+      }
+    });
+    return list;
+  }, [watchlist, visitors]);
+
+  const allVisitorsWithWatchlist = useMemo(() => {
+    const list = [...visitors];
+    const existingIds = new Set(visitors.map(v => String(v.id || '').toLowerCase()));
+    combinedWatchlist.forEach(w => {
+      const wid = String(w.alias || w.id || '');
+      if (wid && !existingIds.has(wid.toLowerCase())) {
+        existingIds.add(wid.toLowerCase());
+        list.push({
+          id: wid,
+          name: w.name || wid,
+          display_name: w.name || wid,
+          department: w.category || 'General Staff',
+          designation: 'Watchlist Target',
+          is_enrolled: false,
+          is_blacklisted: true,
+          blacklist_reason: w.reason || 'Security Watchlist',
+          photo_b64: w.photo_b64 || (w.crops && w.crops[0]) || null,
+          crops: w.crops || (w.photo_b64 ? [w.photo_b64] : []),
+          today_check_in: null,
+          last_seen: w.enrolled_at || null,
+          today_status: 'NOT SEEN TODAY'
+        });
+      }
+    });
+    return list;
+  }, [visitors, combinedWatchlist]);
+
+  const blacklistedStaffCount = useMemo(() => {
+    return allVisitorsWithWatchlist.filter(v => v.is_blacklisted || watchlistIds.has(String(v.id).toLowerCase())).length;
+  }, [allVisitorsWithWatchlist, watchlistIds]);
+
+  const [addWatchlistOpen, setAddWatchlistOpen] = useState(false);
+  const [watchlistForm, setWatchlistForm] = useState({
+    id: '',
+    name: '',
+    reasonPreset: 'Security Screening Required',
+    reasonCustom: '',
+    photoB64: null
+  });
+  const [watchlistPhotoPreview, setWatchlistPhotoPreview] = useState(null);
+  const [savingWatchlist, setSavingWatchlist] = useState(false);
+  const [watchlistSearch, setWatchlistSearch] = useState('');
+
+  const filteredWatchlist = useMemo(() => {
+    return combinedWatchlist.filter(w => {
+      if (!watchlistSearch.trim()) return true;
+      const q = watchlistSearch.toLowerCase();
+      const n = (w.name || '').toLowerCase();
+      const a = (w.alias || w.id || '').toLowerCase();
+      const r = (w.reason || '').toLowerCase();
+      const c = (w.category || '').toLowerCase();
+      return n.includes(q) || a.includes(q) || r.includes(q) || c.includes(q);
+    });
+  }, [combinedWatchlist, watchlistSearch]);
+
+  const handleWatchlistPhotoSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const b64 = ev.target.result;
+      setWatchlistForm(p => ({ ...p, photoB64: b64 }));
+      setWatchlistPhotoPreview(b64);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleAddWatchlist = async (e) => {
+    if (e) e.preventDefault();
+    const finalReason = watchlistForm.reasonPreset === 'Custom'
+      ? (watchlistForm.reasonCustom || 'Security Screening Required')
+      : watchlistForm.reasonPreset;
+    const targetId = (watchlistForm.id || '').trim();
+    const targetName = (watchlistForm.name || '').trim() || targetId || 'Flagged Person';
+
+    if (!targetId && !targetName && !watchlistForm.photoB64) {
+      alert("Please provide an ID, Name, or Photo to blacklist.");
+      return;
+    }
+
+    setSavingWatchlist(true);
+    try {
+      if (watchlistForm.photoB64 && onEnrollManual) {
+        await onEnrollManual(watchlistForm.photoB64, targetName, finalReason);
+      } else if (onBlacklist) {
+        await onBlacklist(targetId || targetName, targetName, finalReason);
+      }
+      showNotice(`✓ Added ${targetName} to Security Watchlist`);
+      setAddWatchlistOpen(false);
+      setWatchlistForm({ id: '', name: '', reasonPreset: 'Security Screening Required', reasonCustom: '', photoB64: null });
+      setWatchlistPhotoPreview(null);
+      if (onDataRefresh) onDataRefresh();
+    } catch (err) {
+      showNotice(`Failed to add: ${err.message}`, false);
+    } finally {
+      setSavingWatchlist(false);
+    }
+  };
 
   // Live timer tick for real-time missing duration updates
   const [nowTs, setNowTs] = useState(() => Date.now());
@@ -56,6 +217,52 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
   const showNotice = (msg, ok = true) => {
     setNotice({ msg, ok });
     setTimeout(() => setNotice(null), 3500);
+  };
+
+  const handleDeleteEmployee = async (empId, empName, e) => {
+    if (e) e.stopPropagation();
+    const name = empName || empId;
+    if (!window.confirm(`Permanently delete profile "${name}" (${empId})?\n\nThis will remove all face crops, sightings, and attendance history.`)) {
+      return;
+    }
+    try {
+      if (onDeleteEmployee) {
+        await onDeleteEmployee(empId);
+      } else {
+        const res = await fetch('/api/visitors/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ visitor_id: empId })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to delete profile');
+      }
+      showNotice(`✓ Profile ${name} deleted`);
+      if (onDataRefresh) onDataRefresh();
+    } catch (err) {
+      showNotice(err.message || 'Error deleting profile', false);
+    }
+  };
+
+  const handleDeleteAllAutoEnrolled = async () => {
+    if (!window.confirm(`Are you sure you want to delete ALL auto-enrolled profiles (${autoEnrolledStaff.length})?\n\nRegistered doctors and staff will be preserved.`)) {
+      return;
+    }
+    try {
+      const res = await fetch('/api/visitors/delete-auto-enrolled', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotice(`✓ ${data.message || 'Auto-enrolled profiles deleted'}`);
+        if (onDataRefresh) onDataRefresh();
+      } else {
+        throw new Error(data.error || 'Failed to delete');
+      }
+    } catch (err) {
+      showNotice(err.message || 'Error deleting auto-enrolled profiles', false);
+    }
   };
 
   const handlePhotoSelect = (e) => {
@@ -136,7 +343,7 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
 
   // Regular sorted visitors for 'details' tab
   const sortedVisitors = useMemo(() => {
-    return [...visitors].sort((a, b) => {
+    return [...allVisitorsWithWatchlist].sort((a, b) => {
       if (sortBy === 'latest_seen') {
         const at = a.last_seen || a.started_at || a.today_check_in || '';
         const bt = b.last_seen || b.started_at || b.today_check_in || '';
@@ -159,15 +366,19 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
       const bt = b.last_seen || b.today_check_in || '';
       return bt.localeCompare(at);
     });
-  }, [visitors, sortBy]);
+  }, [allVisitorsWithWatchlist, sortBy]);
 
   const filtered = useMemo(() => {
     return sortedVisitors.filter(v => {
       const isEnrolled = Boolean(v.is_enrolled);
       const isCheckedOut = v.today_status === 'CHECKED OUT' || v.is_checkout_verified;
+      const isBlk = Boolean(v.is_blacklisted || watchlistIds.has(String(v.id).toLowerCase()));
+      if (v.today_status === 'NOT SEEN TODAY' && statusFilter !== 'blacklisted' && !search.trim()) return false;
+      if (activeSection === 'auto_enroll' && isEnrolled) return false;
+      if (statusFilter === 'blacklisted' && !isBlk) return false;
       if (statusFilter === 'enrolled' && !isEnrolled) return false;
       if (statusFilter === 'auto' && isEnrolled) return false;
-      if (statusFilter === 'in_hospital' && isCheckedOut) return false;
+      if (statusFilter === 'in_hospital' && (isCheckedOut || v.today_status === 'NOT SEEN TODAY')) return false;
       if (statusFilter === 'checked_out' && !isCheckedOut) return false;
       if (deptFilter !== 'all' && (v.department || 'General Staff') !== deptFilter) return false;
       if (search.trim()) {
@@ -180,7 +391,7 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
       }
       return true;
     });
-  }, [sortedVisitors, search, statusFilter, deptFilter]);
+  }, [sortedVisitors, search, statusFilter, deptFilter, activeSection, watchlistIds]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const paged = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
@@ -277,16 +488,19 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
   }, [absentStaff]);
 
   return (
-    <div style={{ backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)', marginBottom: '24px', overflow: 'hidden' }}>
+    <div
+      id="employee-registry-section"
+      style={{ backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)', marginBottom: '24px', overflow: 'hidden' }}
+    >
 
       {/* Top Navigation Tabs Header (Styled exactly like reference dashboard) */}
       <div style={{ padding: '14px 20px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', backgroundColor: '#fafbfc' }}>
         
-        {/* Left Tabs: Employee Details | Absent from Premises */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#f1f5f9', padding: '4px', borderRadius: '10px' }}>
+        {/* Left Tabs: Employee Details | Absent from Premises | Auto-Enrolled Profiles | Security Watchlist */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#f1f5f9', padding: '4px', borderRadius: '10px', flexWrap: 'wrap' }}>
           {/* Tab 1: Employee Details */}
           <button
-            onClick={() => setActiveSection('details')}
+            onClick={() => { switchSection('details'); setStatusFilter('all'); }}
             style={{
               display: 'inline-flex',
               alignItems: 'center',
@@ -310,9 +524,9 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
             Employee Details
           </button>
 
-          {/* Tab 2: Absent from Premises (New Requested Tab) */}
+          {/* Tab 2: Absent from Premises */}
           <button
-            onClick={() => setActiveSection('absent')}
+            onClick={() => switchSection('absent')}
             style={{
               display: 'inline-flex',
               alignItems: 'center',
@@ -345,6 +559,80 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
               {absentStaff.length}
             </span>
           </button>
+
+          {/* Tab 3: Auto-Enrolled Profiles */}
+          <button
+            onClick={() => { switchSection('auto_enroll'); setStatusFilter('auto'); }}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '8px 16px',
+              borderRadius: '8px',
+              border: 'none',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              backgroundColor: activeSection === 'auto_enroll' ? '#d97706' : 'transparent',
+              color: activeSection === 'auto_enroll' ? '#ffffff' : '#64748b',
+              boxShadow: activeSection === 'auto_enroll' ? '0 2px 4px rgba(217, 119, 6, 0.25)' : 'none',
+              transition: 'all 0.15s ease'
+            }}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+              <line x1="8" y1="21" x2="16" y2="21"></line>
+              <line x1="12" y1="17" x2="12" y2="21"></line>
+            </svg>
+            Auto-Enrolled Profiles
+            <span style={{
+              padding: '1px 8px',
+              borderRadius: '9999px',
+              fontSize: '11px',
+              fontWeight: '800',
+              backgroundColor: activeSection === 'auto_enroll' ? '#ffffff' : '#fef3c7',
+              color: activeSection === 'auto_enroll' ? '#d97706' : '#92400e',
+              boxShadow: activeSection === 'auto_enroll' ? '0 1px 2px rgba(0,0,0,0.1)' : 'none'
+            }}>
+              {autoEnrolledStaff.length}
+            </span>
+          </button>
+
+          {/* Tab 4: Security Watchlist */}
+          <button
+            onClick={() => switchSection('watchlist')}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '8px 16px',
+              borderRadius: '8px',
+              border: 'none',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              backgroundColor: activeSection === 'watchlist' ? '#be123c' : 'transparent',
+              color: activeSection === 'watchlist' ? '#ffffff' : '#64748b',
+              boxShadow: activeSection === 'watchlist' ? '0 2px 4px rgba(190, 18, 60, 0.25)' : 'none',
+              transition: 'all 0.15s ease'
+            }}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            Security Watchlist
+            <span style={{
+              padding: '1px 8px',
+              borderRadius: '9999px',
+              fontSize: '11px',
+              fontWeight: '800',
+              backgroundColor: activeSection === 'watchlist' ? '#ffffff' : '#ffe4e6',
+              color: activeSection === 'watchlist' ? '#be123c' : '#9f1239',
+              boxShadow: activeSection === 'watchlist' ? '0 1px 2px rgba(0,0,0,0.1)' : 'none'
+            }}>
+              {combinedWatchlist.length}
+            </span>
+          </button>
         </div>
 
         {/* Right Actions */}
@@ -354,7 +642,53 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
               {notice.msg}
             </span>
           )}
-          {activeSection === 'details' && (
+
+          {/* Auto-Enrollment Stop/Resume Control Button */}
+          {onToggleAutoEnroll && (
+            <button
+              type="button"
+              onClick={onToggleAutoEnroll}
+              title={autoEnrollEnabled ? "Auto-Enrollment is Active. Click to Stop creating new profiles." : "Auto-Enrollment is Stopped. Only existing profiles are checked. Click to Resume."}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '7px',
+                padding: '7px 14px',
+                borderRadius: '8px',
+                backgroundColor: autoEnrollEnabled ? '#ecfdf5' : '#fef2f2',
+                border: `1.5px solid ${autoEnrollEnabled ? '#10b981' : '#ef4444'}`,
+                color: autoEnrollEnabled ? '#065f46' : '#991b1b',
+                fontSize: '12px',
+                fontWeight: '800',
+                cursor: 'pointer',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
+                transition: 'all 0.15s ease'
+              }}
+            >
+              <span style={{
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                backgroundColor: autoEnrollEnabled ? '#10b981' : '#ef4444',
+                boxShadow: `0 0 6px ${autoEnrollEnabled ? '#10b981' : '#ef4444'}`
+              }}></span>
+              <span>{autoEnrollEnabled ? '⚡ Auto-Enroll: ACTIVE' : '⏸️ Auto-Enroll: STOPPED'}</span>
+              <span style={{ fontSize: '11px', opacity: 0.85, fontWeight: '600' }}>
+                {autoEnrollEnabled ? '(Click to Stop)' : '(Existing Only)'}
+              </span>
+            </button>
+          )}
+
+          {/* Action button based on active section */}
+          {activeSection === 'watchlist' ? (
+            <button
+              onClick={() => setAddWatchlistOpen(true)}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '7px 14px', borderRadius: '8px', backgroundColor: '#be123c', color: '#fff', border: 'none', fontSize: '12px', fontWeight: '700', cursor: 'pointer', boxShadow: '0 2px 4px rgba(190,18,60,0.2)' }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Add to Watchlist
+            </button>
+          ) : activeSection !== 'absent' ? (
             <button
               onClick={() => setAddOpen(true)}
               style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '7px 14px', borderRadius: '8px', backgroundColor: '#0284c7', color: '#fff', border: 'none', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
@@ -362,12 +696,55 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
               Add Employee
             </button>
-          )}
+          ) : null}
         </div>
       </div>
 
+      {/* Warning Banner when Auto-Enrollment is Stopped */}
+      {!autoEnrollEnabled && (
+        <div style={{
+          margin: '12px 20px 0 20px',
+          padding: '10px 16px',
+          borderRadius: '10px',
+          backgroundColor: '#fffbeb',
+          border: '1px solid #fde68a',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '12px',
+          color: '#92400e',
+          fontSize: '13px'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ fontSize: '18px' }}>⏸️</span>
+            <div>
+              <strong>Auto-Enrollment is STOPPED:</strong> Cameras will not generate new auto-enrolled profiles for unrecognized faces. All {autoEnrolledStaff.length} existing auto-enrolled and registered profiles are being checked and tracked.
+            </div>
+          </div>
+          {onToggleAutoEnroll && (
+            <button
+              type="button"
+              onClick={onToggleAutoEnroll}
+              style={{
+                padding: '5px 12px',
+                borderRadius: '6px',
+                backgroundColor: '#d97706',
+                color: '#ffffff',
+                border: 'none',
+                fontWeight: '700',
+                fontSize: '12px',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap'
+              }}
+            >
+              Resume Auto-Enroll
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Add Employee Form with Face Photo Upload */}
-      {addOpen && activeSection === 'details' && (
+      {addOpen && activeSection !== 'absent' && (
         <div style={{ padding: '16px 20px', backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
           <form onSubmit={handleAdd} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
             <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
@@ -468,9 +845,181 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
         </div>
       )}
 
-      {/* VIEW 1: REGULAR EMPLOYEE DETAILS REGISTRY */}
-      {activeSection === 'details' && (
+      {/* Add to Security Watchlist Form / Modal */}
+      {addWatchlistOpen && (
+        <div style={{ padding: '16px 20px', backgroundColor: '#fff1f2', borderBottom: '1px solid #fecdd3' }}>
+          <form onSubmit={handleAddWatchlist} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '16px' }}>🚨</span>
+                <span style={{ fontSize: '13px', fontWeight: '800', color: '#9f1239' }}>
+                  Add Person to Security Watchlist & Threat Registry
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setAddWatchlistOpen(false); setWatchlistPhotoPreview(null); }}
+                style={{ background: 'transparent', border: 'none', color: '#9f1239', fontWeight: '800', cursor: 'pointer', fontSize: '14px' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>Target ID / Employee ID</label>
+                <input
+                  value={watchlistForm.id}
+                  onChange={e => setWatchlistForm(p => ({ ...p, id: e.target.value }))}
+                  placeholder="e.g. EMP-23 (or auto-ID)"
+                  style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1', fontSize: '12px', outline: 'none', width: '180px', backgroundColor: '#fff' }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>Person Name / Alias</label>
+                <input
+                  value={watchlistForm.name}
+                  onChange={e => setWatchlistForm(p => ({ ...p, name: e.target.value }))}
+                  placeholder="e.g. Target EMP-23 or Name"
+                  style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1', fontSize: '12px', outline: 'none', width: '190px', backgroundColor: '#fff' }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>Blacklist Reason / Alert Type</label>
+                <select
+                  value={watchlistForm.reasonPreset}
+                  onChange={e => setWatchlistForm(p => ({ ...p, reasonPreset: e.target.value }))}
+                  style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1', fontSize: '12px', backgroundColor: '#fff', outline: 'none', cursor: 'pointer' }}
+                >
+                  <option value="Security Screening Required">Security Screening Required</option>
+                  <option value="Banned from Premises / Restricted Access">Banned from Premises / Restricted Access</option>
+                  <option value="Disciplinary Suspension">Disciplinary Suspension</option>
+                  <option value="VIP / High-Risk Alert">VIP / High-Risk Alert</option>
+                  <option value="Flagged via Live HUD Click">Flagged via Live HUD Click</option>
+                  <option value="Custom">Custom Reason...</option>
+                </select>
+              </div>
+
+              {watchlistForm.reasonPreset === 'Custom' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                  <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>Specify Reason</label>
+                  <input
+                    value={watchlistForm.reasonCustom}
+                    onChange={e => setWatchlistForm(p => ({ ...p, reasonCustom: e.target.value }))}
+                    placeholder="Enter reason..."
+                    style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1', fontSize: '12px', outline: 'none', width: '180px', backgroundColor: '#fff' }}
+                  />
+                </div>
+              )}
+
+              {/* Photo Upload for Watchlist */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>Reference Photo (Optional)</label>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <input
+                    type="file"
+                    id="watchlist-photo-input"
+                    accept="image/*"
+                    onChange={handleWatchlistPhotoSelect}
+                    style={{ display: 'none' }}
+                  />
+                  <label
+                    htmlFor="watchlist-photo-input"
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '5px',
+                      padding: '6px 12px',
+                      borderRadius: '6px',
+                      border: '1px solid #be123c',
+                      backgroundColor: '#fff',
+                      color: '#be123c',
+                      fontSize: '11px',
+                      fontWeight: '700',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                    {watchlistPhotoPreview ? 'Change Photo' : 'Upload Photo'}
+                  </label>
+                  {watchlistPhotoPreview && (
+                    <div style={{ position: 'relative', width: '32px', height: '32px', borderRadius: '6px', overflow: 'hidden', border: '1px solid #be123c' }}>
+                      <img src={watchlistPhotoPreview} alt="Watchlist preview" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                      <button
+                        type="button"
+                        onClick={() => { setWatchlistPhotoPreview(null); setWatchlistForm(p => ({ ...p, photoB64: null })); }}
+                        style={{ position: 'absolute', top: 0, right: 0, background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', fontSize: '9px', cursor: 'pointer', padding: '1px 3px', lineHeight: 1 }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="submit"
+                  disabled={savingWatchlist}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '6px 14px', borderRadius: '6px', backgroundColor: '#be123c', color: '#fff', border: 'none', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
+                >
+                  {savingWatchlist ? 'Adding...' : '🚨 Add to Watchlist'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setAddWatchlistOpen(false); setWatchlistPhotoPreview(null); }}
+                  style={{ padding: '6px 12px', borderRadius: '6px', border: '1px solid #cbd5e1', backgroundColor: '#fff', fontSize: '12px', cursor: 'pointer', color: '#64748b' }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* VIEW 1 & 3: REGULAR EMPLOYEE DETAILS & AUTO-ENROLLED PROFILES */}
+      {(activeSection === 'details' || activeSection === 'auto_enroll') && (
         <>
+          {/* Banner for Auto-Enrolled Section */}
+          {activeSection === 'auto_enroll' && (
+            <div style={{ padding: '12px 20px', backgroundColor: '#fffbeb', borderBottom: '1px solid #fef3c7', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <span style={{ fontSize: '20px' }}>📋</span>
+                <div>
+                  <div style={{ fontSize: '13px', fontWeight: '800', color: '#92400e' }}>
+                    Auto-Enrolled Visitor Profiles ({autoEnrolledStaff.length} Detected)
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#b45309' }}>
+                    {autoEnrollEnabled
+                      ? "Auto-enrollment is currently active. If you are getting flooded with new profiles, click 'Stop Auto-Enroll' above to freeze new creation and check only these existing profiles."
+                      : "Auto-enrollment is STOPPED. All camera detections will only match and check these existing profiles."}
+                  </div>
+                </div>
+              </div>
+              {onToggleAutoEnroll && (
+                <button
+                  type="button"
+                  onClick={onToggleAutoEnroll}
+                  style={{
+                    padding: '6px 14px',
+                    borderRadius: '7px',
+                    backgroundColor: autoEnrollEnabled ? '#dc2626' : '#16a34a',
+                    color: '#fff',
+                    border: 'none',
+                    fontSize: '12px',
+                    fontWeight: '700',
+                    cursor: 'pointer'
+                  }}
+                >
+                  {autoEnrollEnabled ? '⏸️ Stop Auto-Enrollment' : '▶️ Resume Auto-Enrollment'}
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Filter Bar */}
           <div style={{ padding: '10px 20px', borderBottom: '1px solid #f1f5f9', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', backgroundColor: '#fafbfc' }}>
             {/* Search */}
@@ -485,12 +1034,19 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
             </div>
 
             {/* Status Filter Pills */}
-            <div style={{ display: 'flex', backgroundColor: '#f1f5f9', borderRadius: '8px', padding: '3px', gap: '2px' }}>
-              {[['all', `All (${visitors.length})`], ['enrolled', 'Named'], ['auto', 'Auto ID'], ['in_hospital', 'On Duty'], ['checked_out', 'Checked Out']].map(([id, label]) => (
+            <div style={{ display: 'flex', backgroundColor: '#f1f5f9', borderRadius: '8px', padding: '3px', gap: '2px', flexWrap: 'wrap' }}>
+              {[
+                ['all', `All (${activeSection === 'auto_enroll' ? autoEnrolledStaff.length : visitors.length})`],
+                ['enrolled', `Enrolled (${enrolledStaffCount})`],
+                ['auto', `Auto ID (${autoEnrolledStaff.length})`],
+                ['in_hospital', 'On Duty'],
+                ['checked_out', 'Checked Out'],
+                ['blacklisted', `🚨 Blacklisted (${blacklistedStaffCount})`]
+              ].map(([id, label]) => (
                 <button key={id} onClick={() => setStatusFilter(id)}
                   style={{ padding: '3px 10px', borderRadius: '5px', border: 'none', fontSize: '11px', fontWeight: '700', cursor: 'pointer',
-                    backgroundColor: statusFilter === id ? '#ffffff' : 'transparent',
-                    color: statusFilter === id ? '#0284c7' : '#64748b',
+                    backgroundColor: statusFilter === id ? (id === 'blacklisted' ? '#fee2e2' : '#ffffff') : 'transparent',
+                    color: statusFilter === id ? (id === 'blacklisted' ? '#dc2626' : '#0284c7') : '#64748b',
                     boxShadow: statusFilter === id ? '0 1px 2px rgba(0,0,0,0.08)' : 'none' }}>
                   {label}
                 </button>
@@ -518,6 +1074,35 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
               </select>
             </div>
 
+            {(activeSection === 'auto_enroll' || statusFilter === 'auto') && autoEnrolledStaff.length > 0 && (
+              <button
+                type="button"
+                onClick={handleDeleteAllAutoEnrolled}
+                style={{
+                  padding: '5px 12px',
+                  borderRadius: '6px',
+                  border: '1px solid #fda4af',
+                  backgroundColor: '#fff1f2',
+                  color: '#e11d48',
+                  fontSize: '11px',
+                  fontWeight: '800',
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  boxShadow: '0 1px 2px rgba(225, 29, 72, 0.1)',
+                  transition: 'all 0.15s ease'
+                }}
+                title="Delete all auto-enrolled profiles"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+                Delete All Auto-IDs ({autoEnrolledStaff.length})
+              </button>
+            )}
+
             <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#94a3b8', fontWeight: '600' }}>
               {filtered.length} employees · Page {page}/{totalPages}
             </span>
@@ -539,6 +1124,7 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
                 ) : paged.map((v, idx) => {
                   const isEnrolled = Boolean(v.is_enrolled);
                   const isCheckedOut = v.today_status === 'CHECKED OUT' || v.is_checkout_verified;
+                  const isBlk = Boolean(v.is_blacklisted || watchlistIds.has(String(v.id).toLowerCase()));
                   const isEditing = editingId === v.id;
                   const displayName = v.name || v.display_name || v.id;
                   const inTime = fmtTime(v.today_check_in);
@@ -560,7 +1146,7 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
                         cursor: isEditing ? 'default' : 'pointer',
                         transition: 'background 0.1s'
                       }}
-                      onMouseEnter={e => { if (!isEditing) e.currentTarget.style.backgroundColor = '#f0f9ff'; }}
+                      onMouseEnter={e => { if (!isEditing) e.currentTarget.style.backgroundColor = isBlk ? '#fef2f2' : '#f0f9ff'; }}
                       onMouseLeave={e => { if (!isEditing) e.currentTarget.style.backgroundColor = idx % 2 === 0 ? '#ffffff' : '#fafbfc'; }}
                       title="Click row to view face photo, CCTV body capture & in/out journey"
                     >
@@ -586,8 +1172,8 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
                               height: '32px',
                               borderRadius: '6px',
                               overflow: 'hidden',
-                              border: '1px solid #cbd5e1',
-                              backgroundColor: '#e2e8f0',
+                              border: isBlk ? '1.5px solid #f87171' : '1px solid #cbd5e1',
+                              backgroundColor: isBlk ? '#fee2e2' : '#e2e8f0',
                               flexShrink: 0,
                               display: 'flex',
                               alignItems: 'center',
@@ -600,14 +1186,14 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
                                   style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                                 />
                               ) : (
-                                <span style={{ fontSize: '11px', fontWeight: '800', color: '#64748b' }}>
+                                <span style={{ fontSize: '11px', fontWeight: '800', color: isBlk ? '#dc2626' : '#64748b' }}>
                                   {displayName.slice(0, 2).toUpperCase()}
                                 </span>
                               )}
                             </div>
 
                             <div>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
                                 <span style={{ fontWeight: isEnrolled ? '700' : '500', color: isEnrolled ? '#0f172a' : '#64748b' }}>
                                   {displayName}
                                 </span>
@@ -617,6 +1203,12 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
                                   border: `1px solid ${isEnrolled ? '#a7f3d0' : '#cbd5e1'}` }}>
                                   {isEnrolled ? '✓ ENROLLED' : 'AUTO ID'}
                                 </span>
+                                {isBlk && (
+                                  <span style={{ fontSize: '9px', fontWeight: '800', padding: '1px 6px', borderRadius: '4px',
+                                    backgroundColor: '#fee2e2', color: '#dc2626', border: '1px solid #f87171' }}>
+                                    🚨 BLACKLISTED
+                                  </span>
+                                )}
                               </div>
                             </div>
                           </div>
@@ -702,6 +1294,38 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
                               color: isCheckedOut ? '#64748b' : '#059669' }}>
                               {isCheckedOut ? '✓ OUT' : '● ON DUTY'}
                             </span>
+                            {isBlk ? (
+                              <button
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  if (window.confirm(`Remove ${displayName} (${v.id}) from security watchlist?`)) {
+                                    if (onRemoveBlacklist) await onRemoveBlacklist(v.id);
+                                    showNotice(`✓ Unflagged ${displayName}`);
+                                    if (onDataRefresh) onDataRefresh();
+                                  }
+                                }}
+                                style={{ padding: '3px 8px', borderRadius: '5px', backgroundColor: '#fef2f2', border: '1px solid #fca5a5', fontSize: '11px', cursor: 'pointer', color: '#dc2626', fontWeight: '700' }}
+                                title="Remove from security watchlist"
+                              >
+                                Unflag
+                              </button>
+                            ) : (
+                              <button
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  const reason = window.prompt(`Enter reason for blacklisting ${displayName}:`, "Security screening required");
+                                  if (reason) {
+                                    if (onBlacklist) await onBlacklist(v.id, displayName, reason);
+                                    showNotice(`✓ Added ${displayName} to watchlist`);
+                                    if (onDataRefresh) onDataRefresh();
+                                  }
+                                }}
+                                style={{ padding: '3px 8px', borderRadius: '5px', backgroundColor: '#f8fafc', border: '1px solid #cbd5e1', fontSize: '11px', cursor: 'pointer', color: '#64748b', fontWeight: '600' }}
+                                title="Add to security watchlist"
+                              >
+                                Flag
+                              </button>
+                            )}
                             <button
                               onClick={(e) => startEdit(v, e)}
                               style={{ padding: '3px 8px', borderRadius: '5px', backgroundColor: '#f8fafc', border: '1px solid #cbd5e1', fontSize: '11px', cursor: 'pointer', color: '#475569', fontWeight: '600' }}
@@ -718,6 +1342,29 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
                               title="View photos & in/out history"
                             >
                               View ➔
+                            </button>
+                            <button
+                              onClick={(e) => handleDeleteEmployee(v.id, displayName, e)}
+                              style={{
+                                padding: '3px 8px',
+                                borderRadius: '5px',
+                                backgroundColor: '#fff1f2',
+                                border: '1px solid #fecdd3',
+                                fontSize: '11px',
+                                cursor: 'pointer',
+                                color: '#e11d48',
+                                fontWeight: '700',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '3px'
+                              }}
+                              title="Permanently delete profile and attendance records"
+                            >
+                              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                <polyline points="3 6 5 6 21 6"></polyline>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                              </svg>
+                              Delete
                             </button>
                           </div>
                         )}
@@ -1069,28 +1716,395 @@ export default function EmployeeRegistry({ visitors = [], onDataRefresh, onSelec
 
                         {/* Actions */}
                         <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (onSelectEmployee) onSelectEmployee(v.id);
-                            }}
-                            style={{
-                              padding: '4px 10px',
-                              borderRadius: '6px',
-                              backgroundColor: '#fff7ed',
-                              border: '1px solid #fdba74',
-                              fontSize: '11px',
-                              cursor: 'pointer',
-                              color: '#c2410c',
-                              fontWeight: '800',
-                              display: 'inline-flex',
+                          <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (onSelectEmployee) onSelectEmployee(v.id);
+                              }}
+                              style={{
+                                padding: '4px 10px',
+                                borderRadius: '6px',
+                                backgroundColor: '#fff7ed',
+                                border: '1px solid #fdba74',
+                                fontSize: '11px',
+                                cursor: 'pointer',
+                                color: '#c2410c',
+                                fontWeight: '800',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '4px'
+                              }}
+                              title="Inspect biometric photos and movement journey"
+                            >
+                              View Journey ➔
+                            </button>
+                            <button
+                              onClick={(e) => handleDeleteEmployee(v.id, v.name || v.id, e)}
+                              style={{
+                                padding: '4px 8px',
+                                borderRadius: '6px',
+                                backgroundColor: '#fff1f2',
+                                border: '1px solid #fecdd3',
+                                fontSize: '11px',
+                                cursor: 'pointer',
+                                color: '#e11d48',
+                                fontWeight: '700',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '3px'
+                              }}
+                              title="Permanently delete profile and records"
+                            >
+                              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                <polyline points="3 6 5 6 21 6"></polyline>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                              </svg>
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* VIEW 4: SECURITY WATCHLIST / BLACKLISTED PERSONS */}
+      {activeSection === 'watchlist' && (
+        <div>
+          {/* Security Alert Header Banner */}
+          <div style={{
+            padding: '16px 20px',
+            backgroundColor: '#fff1f2',
+            borderBottom: '1px solid #fecdd3',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '16px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <div style={{
+                width: '42px',
+                height: '42px',
+                borderRadius: '10px',
+                backgroundColor: '#ffe4e6',
+                border: '1px solid #fecdd3',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: '#be123c'
+              }}>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                </svg>
+              </div>
+              <div>
+                <h4 style={{ margin: 0, fontSize: '14px', fontWeight: '800', color: '#9f1239' }}>
+                  Hospital Security Watchlist & Blacklisted Persons Registry
+                </h4>
+                <p style={{ margin: '2px 0 0 0', fontSize: '12px', color: '#be123c' }}>
+                  Active CCTV biometric surveillance continuously compares faces in all camera feeds against this registry. Any match instantly triggers high-priority security HUD alerts.
+                </p>
+              </div>
+            </div>
+
+            {/* Quick Metrics */}
+            <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+              <div style={{ backgroundColor: '#ffffff', border: '1px solid #fda4af', padding: '6px 14px', borderRadius: '8px', textAlign: 'center' }}>
+                <div style={{ fontSize: '10px', fontWeight: '800', color: '#9f1239', textTransform: 'uppercase' }}>Flagged Persons</div>
+                <div style={{ fontSize: '15px', fontWeight: '900', color: '#be123c' }}>{combinedWatchlist.length} Total</div>
+              </div>
+              <div style={{ backgroundColor: '#ffffff', border: '1px solid #fda4af', padding: '6px 14px', borderRadius: '8px', textAlign: 'center' }}>
+                <div style={{ fontSize: '10px', fontWeight: '800', color: '#9f1239', textTransform: 'uppercase' }}>Detected Today</div>
+                <div style={{ fontSize: '15px', fontWeight: '900', color: '#991b1b' }}>
+                  {combinedWatchlist.filter(w => visitors.some(v => {
+                    const wid = String(w.alias || w.id || '').toLowerCase();
+                    return String(v.id || '').toLowerCase() === wid;
+                  })).length} Sighted
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Search & Actions Bar */}
+          <div style={{ padding: '10px 20px', borderBottom: '1px solid #f1f5f9', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', backgroundColor: '#fafbfc' }}>
+            <div style={{ position: 'relative' }}>
+              <svg style={{ position: 'absolute', left: '9px', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input
+                value={watchlistSearch}
+                onChange={e => setWatchlistSearch(e.target.value)}
+                placeholder="Search flagged person, ID, or reason..."
+                style={{ paddingLeft: '28px', paddingRight: '10px', paddingTop: '6px', paddingBottom: '6px', borderRadius: '7px', border: '1px solid #e2e8f0', fontSize: '12px', backgroundColor: '#fff', color: '#0f172a', outline: 'none', width: '260px' }}
+              />
+            </div>
+
+            <button
+              onClick={() => setAddWatchlistOpen(true)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px',
+                padding: '6px 12px',
+                borderRadius: '7px',
+                backgroundColor: '#be123c',
+                color: '#fff',
+                border: 'none',
+                fontSize: '11px',
+                fontWeight: '700',
+                cursor: 'pointer'
+              }}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              + Add to Watchlist
+            </button>
+
+            <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#64748b', fontWeight: '600' }}>
+              {filteredWatchlist.length} flagged individuals registered
+            </span>
+          </div>
+
+          {/* Watchlist Table */}
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '12px' }}>
+              <thead>
+                <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+                  {['Person / Photo', 'Target / Alias ID', 'Category / Role', 'Reason / Security Flag', 'Date Added', 'Today\'s CCTV Status', 'Actions'].map(h => (
+                    <th key={h} style={{ padding: '10px 14px', fontSize: '11px', fontWeight: '800', color: '#475569', whiteSpace: 'nowrap' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredWatchlist.length === 0 ? (
+                  <tr>
+                    <td colSpan="7" style={{ padding: '36px', textAlign: 'center', color: '#64748b' }}>
+                      <div style={{ fontSize: '14px', fontWeight: '700', color: '#be123c', marginBottom: '4px' }}>
+                        No Security Watchlist Entries Found
+                      </div>
+                      <div style={{ fontSize: '12px', color: '#94a3b8' }}>
+                        {watchlistSearch
+                          ? `No records match "${watchlistSearch}".`
+                          : "Use '+ Add to Watchlist' above, or enable 'CLICK-TO-FLAG' on the live video stream to flag a person directly."}
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  filteredWatchlist.map((w, idx) => {
+                    const targetId = w.alias || w.id;
+                    const displayName = w.name || targetId;
+                    const thumb = (w.crops && w.crops[0]) || w.photo_b64 || null;
+                    const addedDate = fmtTime(w.enrolled_at || w.created_at);
+
+                    // Check if seen today in visitors list
+                    const visMatch = visitors.find(v => {
+                      const vid = String(v.id || '').toLowerCase();
+                      const wid = String(w.alias || w.id || '').toLowerCase();
+                      return vid === wid;
+                    });
+                    const isSightedToday = Boolean(visMatch);
+
+                    return (
+                      <tr
+                        key={w.id || idx}
+                        style={{
+                          borderBottom: '1px solid #f1f5f9',
+                          backgroundColor: idx % 2 === 0 ? '#ffffff' : '#fffbfa',
+                          transition: 'background 0.1s'
+                        }}
+                        onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#fff1f2'; }}
+                        onMouseLeave={e => { e.currentTarget.style.backgroundColor = idx % 2 === 0 ? '#ffffff' : '#fffbfa'; }}
+                      >
+                        {/* Person / Photo */}
+                        <td style={{ padding: '10px 14px', minWidth: '190px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <div style={{
+                              width: '36px',
+                              height: '36px',
+                              borderRadius: '7px',
+                              overflow: 'hidden',
+                              border: '1.5px solid #fda4af',
+                              backgroundColor: '#ffe4e6',
+                              flexShrink: 0,
+                              display: 'flex',
                               alignItems: 'center',
-                              gap: '4px'
-                            }}
-                            title="Inspect biometric photos and movement journey"
-                          >
-                            View Journey ➔
-                          </button>
+                              justifyContent: 'center'
+                            }}>
+                              {thumb ? (
+                                <img
+                                  src={thumb.startsWith('data:') ? thumb : `data:image/jpeg;base64,${thumb}`}
+                                  alt={displayName}
+                                  style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                />
+                              ) : (
+                                <span style={{ fontSize: '11px', fontWeight: '800', color: '#be123c' }}>
+                                  {displayName.slice(0, 2).toUpperCase()}
+                                </span>
+                              )}
+                            </div>
+                            <div>
+                              <div style={{ fontWeight: '700', color: '#0f172a' }}>{displayName}</div>
+                              <span style={{
+                                fontSize: '9px',
+                                fontWeight: '800',
+                                padding: '1px 5px',
+                                borderRadius: '4px',
+                                backgroundColor: '#fee2e2',
+                                color: '#be123c',
+                                border: '1px solid #fca5a5'
+                              }}>
+                                🚨 BLACKLISTED
+                              </span>
+                            </div>
+                          </div>
+                        </td>
+
+                        {/* Target / Alias ID */}
+                        <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontWeight: '800', fontSize: '12px', color: '#0284c7' }}>
+                            {targetId}
+                          </span>
+                        </td>
+
+                        {/* Category / Role */}
+                        <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                          <span style={{ color: '#475569', fontWeight: '600' }}>
+                            {w.category || (visMatch?.department) || 'Visitor / Staff'}
+                          </span>
+                        </td>
+
+                        {/* Reason / Security Flag */}
+                        <td style={{ padding: '10px 14px' }}>
+                          <div style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            padding: '3px 8px',
+                            borderRadius: '5px',
+                            backgroundColor: '#fff1f2',
+                            color: '#9f1239',
+                            border: '1px solid #fecdd3',
+                            fontSize: '11px',
+                            fontWeight: '700'
+                          }}>
+                            <span>⚠️</span>
+                            <span>{w.reason || 'Security Alert'}</span>
+                          </div>
+                        </td>
+
+                        {/* Date Added */}
+                        <td style={{ padding: '10px 14px', whiteSpace: 'nowrap', fontFamily: 'var(--font-mono)', fontSize: '11px', color: '#64748b' }}>
+                          {addedDate}
+                        </td>
+
+                        {/* Today's CCTV Status */}
+                        <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                          {isSightedToday ? (
+                            <div>
+                              <div style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '5px',
+                                padding: '2px 7px',
+                                borderRadius: '4px',
+                                backgroundColor: '#fee2e2',
+                                color: '#dc2626',
+                                fontSize: '10px',
+                                fontWeight: '800'
+                              }}>
+                                <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#dc2626' }} />
+                                SIGHTED ON CAMERA
+                              </div>
+                              <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px' }}>
+                                {fmtTime(visMatch.last_seen)} · {visMatch.last_camera_name || visMatch.camera_name || 'Staff Inbound'}
+                              </div>
+                            </div>
+                          ) : (
+                            <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                              Not sighted today
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Actions */}
+                        <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                          <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (window.confirm(`Remove ${displayName} (${targetId}) from the security watchlist?`)) {
+                                  if (onRemoveBlacklist) {
+                                    await onRemoveBlacklist(w);
+                                  }
+                                  showNotice(`✓ Removed ${displayName} from watchlist`);
+                                  if (onDataRefresh) onDataRefresh();
+                                }
+                              }}
+                              style={{
+                                padding: '4px 10px',
+                                borderRadius: '6px',
+                                backgroundColor: '#fef2f2',
+                                border: '1px solid #fecaca',
+                                fontSize: '11px',
+                                cursor: 'pointer',
+                                color: '#b91c1c',
+                                fontWeight: '700'
+                              }}
+                              title="Remove from watchlist"
+                            >
+                              ✓ Unflag / Remove
+                            </button>
+
+                            {visMatch && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (onSelectEmployee) onSelectEmployee(targetId);
+                                }}
+                                style={{
+                                  padding: '4px 8px',
+                                  borderRadius: '6px',
+                                  backgroundColor: '#f0f9ff',
+                                  border: '1px solid #bae6fd',
+                                  fontSize: '11px',
+                                  cursor: 'pointer',
+                                  color: '#0284c7',
+                                  fontWeight: '700'
+                                }}
+                                title="Audit full CCTV movement journey"
+                              >
+                                Audit Journey ➔
+                              </button>
+                            )}
+
+                            <button
+                              onClick={(e) => handleDeleteEmployee(targetId, displayName, e)}
+                              style={{
+                                padding: '4px 8px',
+                                borderRadius: '6px',
+                                backgroundColor: '#fff1f2',
+                                border: '1px solid #fecdd3',
+                                fontSize: '11px',
+                                cursor: 'pointer',
+                                color: '#e11d48',
+                                fontWeight: '700',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '3px'
+                              }}
+                              title="Permanently delete profile and records from system"
+                            >
+                              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                <polyline points="3 6 5 6 21 6"></polyline>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                              </svg>
+                              Delete
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
