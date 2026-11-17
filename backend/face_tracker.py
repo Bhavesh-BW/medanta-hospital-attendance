@@ -4267,7 +4267,7 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
 
         if path == '/api/kpis':
             params = urllib.parse.parse_qs(parsed.query)
-            period = params.get('range', ['today'])[0]
+            period = params.get('range', params.get('period', ['today']))[0]
             return self.send_json(200, tracker.get_kpis(period=period))
 
         if path in ('/api/department-attendance', '/api/departments/attendance'):
