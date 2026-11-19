@@ -1233,11 +1233,12 @@ export default function EmployeeRegistry({
                 ) : paged.map((v, idx) => {
                   const isEnrolled = Boolean(v.is_enrolled);
                   const isCheckedOut = v.today_status === 'CHECKED OUT' || v.is_checkout_verified;
+                  const isNotCheckedIn = !v.today_check_in || v.today_status === 'NOT CHECKED IN' || v.today_status === 'ABSENT';
                   const isBlk = Boolean(v.is_blacklisted || watchlistIds.has(String(v.id).toLowerCase()));
                   const isEditing = editingId === v.id;
                   const displayName = v.name || v.display_name || v.id;
-                  const inTime = fmtTime(v.today_check_in);
-                  const outTime = v.is_checkout_verified ? fmtTime(v.today_check_out) : '—';
+                  const inTime = v.today_check_in ? fmtTime(v.today_check_in) : '—';
+                  const outTime = v.today_check_out ? fmtTime(v.today_check_out) : '—';
                   const dur = v.today_duration_str || (v.stats_30d?.today_duration) || '—';
                   const thumb = v.crops?.[0] || v.photo_b64 || null;
 
@@ -1361,17 +1362,30 @@ export default function EmployeeRegistry({
 
                       {/* Last Sighting */}
                       <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
-                        <div style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: '#0f172a', fontWeight: '700' }}>
-                          {fmtTime(v.last_seen || v.started_at || v.today_check_in)}
-                        </div>
-                        <div style={{ fontSize: '10px', color: '#64748b' }}>
-                          {v.last_camera_name || v.camera_name || 'Staff Inbound Entry'}
-                        </div>
+                        {v.last_seen ? (
+                          <div>
+                            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: '#0f172a', fontWeight: '700' }}>
+                              {fmtTime(v.last_seen)}
+                            </div>
+                            <div style={{ fontSize: '10px', color: '#0284c7', fontWeight: '600', display: 'flex', alignItems: 'center', gap: '3px', marginTop: '1px' }}>
+                              <span>📍</span>
+                              <span style={{ maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {v.last_camera_name || v.camera_name || 'Checkpoint'}
+                              </span>
+                            </div>
+                          </div>
+                        ) : (
+                          <div>
+                            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: '#94a3b8' }}>—</div>
+                            <div style={{ fontSize: '10px', color: '#94a3b8' }}>Not detected yet</div>
+                          </div>
+                        )}
                       </td>
 
                       {/* Today Out */}
                       <td style={{ padding: '10px 14px', fontFamily: 'var(--font-mono)', fontSize: '11px', whiteSpace: 'nowrap',
-                        color: isCheckedOut ? '#15803d' : '#94a3b8', fontWeight: isCheckedOut ? '700' : 'normal' }}>
+                        color: isCheckedOut ? '#dc2626' : (v.today_check_out ? '#0369a1' : '#94a3b8'),
+                        fontWeight: (isCheckedOut || v.today_check_out) ? '700' : 'normal' }}>
                         {outTime}
                       </td>
 
@@ -1399,9 +1413,10 @@ export default function EmployeeRegistry({
                         ) : (
                           <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                             <span style={{ fontSize: '10px', fontWeight: '700', padding: '2px 6px', borderRadius: '4px',
-                              backgroundColor: isCheckedOut ? '#f1f5f9' : '#ecfdf5',
-                              color: isCheckedOut ? '#64748b' : '#059669' }}>
-                              {isCheckedOut ? '✓ OUT' : '● ON DUTY'}
+                              backgroundColor: isNotCheckedIn ? '#f8fafc' : (isCheckedOut ? '#f1f5f9' : '#ecfdf5'),
+                              color: isNotCheckedIn ? '#94a3b8' : (isCheckedOut ? '#64748b' : '#059669'),
+                              border: isNotCheckedIn ? '1px solid #e2e8f0' : 'none' }}>
+                              {isNotCheckedIn ? '— NOT IN PREMISES' : (isCheckedOut ? '✓ OUT' : '● ON DUTY')}
                             </span>
                             {isBlk ? (
                               <button

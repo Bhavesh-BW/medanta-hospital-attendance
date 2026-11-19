@@ -232,12 +232,12 @@ export default function App() {
     }
   };
 
-  const handleAddCamera = async ({ name, location, rtsp }) => {
+  const handleAddCamera = async ({ name, location, rtsp, role }) => {
     try {
       const res = await fetch('/api/cameras/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, location, rtsp })
+        body: JSON.stringify({ name, location: location || name, rtsp, role: role || 'entry' })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to add camera');
@@ -253,11 +253,16 @@ export default function App() {
   };
 
   const handleRemoveCamera = async (camId) => {
-    if (camId === 'staff' || camId === 'main') {
-      alert("Primary entrance camera is protected and cannot be deleted.");
+    const camToRemove = cameras.find((c) => c.id === camId);
+    const entryCameras = cameras.filter((c) => c.role === 'entry');
+    if (camToRemove?.role === 'entry' && entryCameras.length <= 1) {
+      alert("Cannot remove camera: At least one camera with 'entry' role must remain active in the system.");
       return;
     }
-    if (!window.confirm("Are you sure you want to remove this camera checkpoint?")) return;
+    if (cameras.length <= 1) {
+      alert("At least one camera must remain active. Cannot delete the only remaining camera checkpoint.");
+      return;
+    }
     try {
       const res = await fetch('/api/cameras/remove', {
         method: 'POST',
@@ -266,6 +271,7 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to remove camera');
+      if (data.active) setActiveCamera(data.active);
       await fetchData();
     } catch (e) {
       alert(`Error removing camera: ${e.message}`);

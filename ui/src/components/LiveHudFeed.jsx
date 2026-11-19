@@ -1,6 +1,249 @@
 import React, { useState, useEffect } from 'react';
 import { playTacticalChime } from '../utils/alertSound';
 
+function CameraFormModal({
+  isOpen,
+  isEdit = false,
+  onClose,
+  onSubmit,
+  onDeleteCamera,
+  cameras = [],
+  selectedId,
+  onSelectCamera,
+  camName,
+  setCamName,
+  camRole,
+  setCamRole,
+  camRtsp,
+  setCamRtsp,
+  submitting,
+  error
+}) {
+  if (!isOpen) return null;
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        backgroundColor: 'rgba(15, 23, 42, 0.72)',
+        backdropFilter: 'blur(4px)',
+        zIndex: 99999,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '20px'
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="med-card"
+        style={{
+          width: '100%',
+          maxWidth: '520px',
+          backgroundColor: '#ffffff',
+          borderRadius: '16px',
+          padding: '24px',
+          boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)'
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '20px' }}>{isEdit ? '✏️' : '📹'}</span>
+            <h3 style={{ fontSize: '16px', fontWeight: '800', color: '#0f172a', margin: 0 }}>
+              {isEdit ? 'Edit Camera Checkpoint' : 'Add New Hospital Camera Checkpoint'}
+            </h3>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{ background: 'none', border: 'none', fontSize: '18px', color: '#64748b', cursor: 'pointer' }}
+          >
+            ✕
+          </button>
+        </div>
+
+        <p style={{ fontSize: '12px', color: '#64748b', marginBottom: '16px' }}>
+          {isEdit
+            ? 'Modify the camera name, attendance role, or RTSP stream URL for this checkpoint.'
+            : 'Register an RTSP feed to continuously track staff attendance, movement, and duty hours across checkpoints.'}
+        </p>
+
+        <form onSubmit={onSubmit}>
+          {isEdit && cameras.length > 0 && (
+            <div style={{ marginBottom: '14px' }}>
+              <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
+                Select Camera Checkpoint:
+              </label>
+              <select
+                value={selectedId}
+                onChange={(e) => onSelectCamera && onSelectCamera(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '8px 12px',
+                  borderRadius: '8px',
+                  border: '1px solid #cbd5e1',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  outline: 'none',
+                  boxSizing: 'border-box',
+                  backgroundColor: '#f8fafc'
+                }}
+              >
+                {cameras.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} ({c.id}) — {c.role === 'entry' ? 'Inbound Entry' : c.role === 'exit' ? 'Check-Out Exit' : 'Inwards / Perimeter'}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* 1. Camera Name */}
+          <div style={{ marginBottom: '12px' }}>
+            <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
+              Camera Name:
+            </label>
+            <input
+              type="text"
+              placeholder="e.g. Reception Desk Cam"
+              value={camName}
+              onChange={(e) => setCamName(e.target.value)}
+              style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
+              required
+            />
+          </div>
+
+          {/* 2. Attendance Role */}
+          <div style={{ marginBottom: '14px' }}>
+            <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
+              Attendance Role:
+            </label>
+            <select
+              value={camRole}
+              onChange={(e) => setCamRole(e.target.value)}
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                borderRadius: '8px',
+                border: '1px solid #cbd5e1',
+                fontSize: '13px',
+                fontWeight: '600',
+                outline: 'none',
+                boxSizing: 'border-box'
+              }}
+            >
+              <option value="entry">Inbound Entry (Daily Check-In & Entry Attendance)</option>
+              <option value="internal">Inwards / Perimeter (Transit & Sighting Tracking)</option>
+              <option value="exit">Check-Out Exit (Daily Check-Out & Departure Attendance)</option>
+            </select>
+            <span style={{ fontSize: '11px', color: '#64748b', marginTop: '4px', display: 'block' }}>
+              {camRole === 'entry' && '🟢 Inbound entry: Updates employee check-in time and logs checkpoint in journey.'}
+              {camRole === 'internal' && '🔵 Inwards / perimeter: Updates the latest spotted snapshot in journey log without altering check-in/out.'}
+              {camRole === 'exit' && '🟠 Check-out exit: Updates employee check-out time, calculates duty duration, and logs in journey.'}
+            </span>
+          </div>
+
+          {/* 3. RTSP Stream URL */}
+          <div style={{ marginBottom: '16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+              <label style={{ fontSize: '12px', fontWeight: '700', color: '#334155' }}>
+                RTSP Stream URL:
+              </label>
+              <span style={{ fontSize: '11px', color: '#0284c7', fontWeight: '600' }}>
+                Port: 31554 / 40001
+              </span>
+            </div>
+            <input
+              type="text"
+              placeholder="rtsp://124.123.89.162:31554/live/..."
+              value={camRtsp}
+              onChange={(e) => setCamRtsp(e.target.value)}
+              style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' }}
+              required
+            />
+          </div>
+
+          {error && (
+            <div style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#b91c1c', fontSize: '12px', marginBottom: '14px' }}>
+              {error}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', justifyContent: isEdit ? 'space-between' : 'flex-end', alignItems: 'center', gap: '10px' }}>
+            {isEdit && (() => {
+              const entryCams = cameras.filter((c) => c.role === 'entry');
+              const currentCam = cameras.find((c) => c.id === selectedId);
+              const isSoleEntry = currentCam?.role === 'entry' && entryCams.length <= 1;
+              if (cameras.length <= 1) {
+                return (
+                  <span style={{ fontSize: '11px', color: '#94a3b8', fontStyle: 'italic' }}>
+                    🔒 At least 1 camera required
+                  </span>
+                );
+              }
+              if (isSoleEntry) {
+                return (
+                  <span style={{ fontSize: '11px', color: '#b45309', fontStyle: 'italic' }}>
+                    🔒 At least 1 entry camera required
+                  </span>
+                );
+              }
+              return (
+                <button
+                  type="button"
+                  onClick={() => onDeleteCamera && onDeleteCamera(selectedId)}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: '8px',
+                    backgroundColor: '#fee2e2',
+                    border: '1px solid #fecaca',
+                    color: '#dc2626',
+                    fontSize: '12px',
+                    fontWeight: '700',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                  }}
+                >
+                  🗑 Delete Camera
+                </button>
+              );
+            })()}
+
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button
+                type="button"
+                onClick={onClose}
+                style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '12px', fontWeight: '700', color: '#475569', cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={submitting}
+                style={{
+                  padding: '8px 18px',
+                  borderRadius: '8px',
+                  backgroundColor: isEdit ? '#0f766e' : '#0284c7',
+                  border: 'none',
+                  color: '#ffffff',
+                  fontSize: '12px',
+                  fontWeight: '700',
+                  cursor: 'pointer'
+                }}
+              >
+                {submitting ? (isEdit ? 'Saving Changes...' : 'Adding Pipeline...') : (isEdit ? 'Save Camera Changes' : 'Add Camera Pipeline')}
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 export default function LiveHudFeed({
   activeCamera = 'main',
   cameras = [],
@@ -159,6 +402,7 @@ export default function LiveHudFeed({
   const [newCamName, setNewCamName] = useState('');
   const [newCamLocation, setNewCamLocation] = useState('');
   const [newCamRtsp, setNewCamRtsp] = useState('');
+  const [newCamRole, setNewCamRole] = useState('entry');
   const [submittingCam, setSubmittingCam] = useState(false);
   const [addError, setAddError] = useState('');
 
@@ -188,14 +432,16 @@ export default function LiveHudFeed({
     setNewCamName('');
     setNewCamLocation('');
     setNewCamRtsp('');
+    setNewCamRole('entry');
     setAddError('');
     setShowAddModal(true);
   };
 
-  const handlePresetSelect = (name, loc, rtsp) => {
+  const handlePresetSelect = (name, loc, rtsp, role = 'entry') => {
     setNewCamName(name);
     setNewCamLocation(loc);
     setNewCamRtsp(rtsp);
+    setNewCamRole(role);
   };
 
   const handleSubmitNewCamera = async (e) => {
@@ -215,8 +461,9 @@ export default function LiveHudFeed({
       if (onAddCamera) {
         const res = await onAddCamera({
           name: newCamName.trim(),
-          location: newCamLocation.trim() || 'Hospital Zone',
-          rtsp: newCamRtsp.trim()
+          location: newCamName.trim(),
+          rtsp: newCamRtsp.trim(),
+          role: newCamRole
         });
         if (res && res.success === false) {
           setAddError(res.error || 'Failed to add camera');
@@ -233,17 +480,32 @@ export default function LiveHudFeed({
     }
   };
 
-  const handleDeleteCamera = (camId) => {
-    if (camId === 'main') {
-      alert('Primary Main Porch Entry camera is protected and cannot be deleted.');
+  const handleDeleteCamera = async (camId) => {
+    const camObj = cameras.find((c) => c.id === camId);
+    const entryCameras = cameras.filter((c) => c.role === 'entry');
+    if (camObj?.role === 'entry' && entryCameras.length <= 1) {
+      alert("Cannot remove camera: At least one camera with 'entry' role must remain active in the system.");
       return;
     }
-    if (window.confirm(`Are you sure you want to remove camera checkpoint "${camId}"?`)) {
+    if (cameras.length <= 1) {
+      alert('At least one camera must remain active. Cannot delete the only remaining camera checkpoint.');
+      return;
+    }
+    const camName = camObj?.name || camId;
+    if (window.confirm(`Are you sure you want to remove camera checkpoint "${camName}"?`)) {
       if (onRemoveCamera) {
-        onRemoveCamera(camId);
+        await onRemoveCamera(camId);
       }
+      if (showEditModal && editCamId === camId) {
+        setShowEditModal(false);
+      }
+      setStreamKey(Date.now());
+      if (onDataRefresh) onDataRefresh();
     }
   };
+
+  // Manage All Cameras Modal State
+  const [showManageModal, setShowManageModal] = useState(false);
 
   // Edit Camera Modal State & Handlers
   const [showEditModal, setShowEditModal] = useState(false);
@@ -388,6 +650,28 @@ export default function LiveHudFeed({
               <span>🔲</span> Focus (1-Cam)
             </button>
           </div>
+
+          {/* Manage Cameras Button */}
+          <button
+            type="button"
+            onClick={() => setShowManageModal(true)}
+            style={{
+              padding: '6px 12px',
+              borderRadius: '8px',
+              backgroundColor: '#f8fafc',
+              color: '#334155',
+              border: '1px solid #cbd5e1',
+              fontSize: '12px',
+              fontWeight: '700',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              cursor: 'pointer'
+            }}
+            title="View, edit and configure all registered camera channels"
+          >
+            <span>⚙️</span> Manage Cameras ({cameras.length})
+          </button>
 
           {/* Add Camera Button */}
           <button
@@ -561,185 +845,6 @@ export default function LiveHudFeed({
 
 
 
-      {/* Edit Camera Modal */}
-      {showEditModal && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            backgroundColor: 'rgba(15, 23, 42, 0.72)',
-            backdropFilter: 'blur(4px)',
-            zIndex: 99999,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '20px'
-          }}
-          onClick={() => setShowEditModal(false)}
-        >
-          <div
-            className="med-card"
-            style={{
-              width: '100%',
-              maxWidth: '540px',
-              backgroundColor: '#ffffff',
-              borderRadius: '16px',
-              padding: '24px',
-              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)'
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '20px' }}>✏️</span>
-                <h3 style={{ fontSize: '16px', fontWeight: '800', color: '#0f172a', margin: 0 }}>
-                  Edit Camera & RTSP URL Configuration
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowEditModal(false)}
-                style={{ background: 'none', border: 'none', fontSize: '18px', color: '#64748b', cursor: 'pointer' }}
-              >
-                ✕
-              </button>
-            </div>
-
-            <p style={{ fontSize: '12px', color: '#64748b', marginBottom: '16px' }}>
-              Modify the RTSP stream URL, display name, physical location, or attendance role for this camera checkpoint. Changes take effect immediately without restarting the server.
-            </p>
-
-            <form onSubmit={handleSubmitEditCamera}>
-              {/* Select Camera to Edit */}
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Select Camera Checkpoint:
-                </label>
-                <select
-                  value={editCamId}
-                  onChange={(e) => populateEditFields(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    fontWeight: '600',
-                    outline: 'none',
-                    boxSizing: 'border-box',
-                    backgroundColor: '#f8fafc'
-                  }}
-                >
-                  {cameras.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} ({c.id}) — {c.location}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Camera Display Name:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamName}
-                    onChange={(e) => setEditCamName(e.target.value)}
-                    placeholder="e.g. Staff Inbound Entry"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                    required
-                  />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Location / Zone:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamLocation}
-                    onChange={(e) => setEditCamLocation(e.target.value)}
-                    placeholder="e.g. Ground Floor Gate 01"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                  />
-                </div>
-              </div>
-
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Attendance Role:
-                </label>
-                <select
-                  value={editCamRole}
-                  onChange={(e) => setEditCamRole(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    outline: 'none',
-                    boxSizing: 'border-box'
-                  }}
-                >
-                  <option value="entry">Inbound Entry (Daily Check-In & Entry Attendance)</option>
-                  <option value="exit">Check-Out Exit (Daily Check-Out & Final Departure Attendance)</option>
-                  <option value="internal">Internal Ward / Clinic (Transit & Sighting Tracking)</option>
-                  <option value="perimeter">Perimeter / Security (General Access Tracking)</option>
-                </select>
-                <span style={{ fontSize: '11px', color: '#64748b', marginTop: '2px', display: 'block' }}>
-                  {editCamRole === 'exit'
-                    ? "⚠️ Exit role: Sightings at this camera calculate the employee's final check-out and total presence duration."
-                    : 'Sightings at this camera track employee presence and movement.'}
-                </span>
-              </div>
-
-              <div style={{ marginBottom: '16px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
-                  <label style={{ fontSize: '12px', fontWeight: '700', color: '#334155' }}>
-                    RTSP Stream URL:
-                  </label>
-                  <span style={{ fontSize: '11px', color: '#0284c7', fontWeight: '600' }}>
-                    Port: 31554
-                  </span>
-                </div>
-                <input
-                  type="text"
-                  value={editCamRtsp}
-                  onChange={(e) => setEditCamRtsp(e.target.value)}
-                  placeholder="rtsp://124.123.89.162:31554/live/..."
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' }}
-                  required
-                />
-              </div>
-
-              {editError && (
-                <div style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#b91c1c', fontSize: '12px', marginBottom: '14px' }}>
-                  {editError}
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                <button
-                  type="button"
-                  onClick={() => setShowEditModal(false)}
-                  style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '12px', fontWeight: '700', color: '#475569', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submittingEdit}
-                  style={{ padding: '8px 18px', borderRadius: '8px', backgroundColor: '#0f766e', border: 'none', color: '#ffffff', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
-                >
-                  {submittingEdit ? 'Saving Changes...' : 'Save Camera Changes'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* Cross-Camera Live Transit Ticker Banner */}
       {latestTransit && (
@@ -796,185 +901,6 @@ export default function LiveHudFeed({
 
 
 
-      {/* Edit Camera Modal */}
-      {showEditModal && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            backgroundColor: 'rgba(15, 23, 42, 0.72)',
-            backdropFilter: 'blur(4px)',
-            zIndex: 99999,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '20px'
-          }}
-          onClick={() => setShowEditModal(false)}
-        >
-          <div
-            className="med-card"
-            style={{
-              width: '100%',
-              maxWidth: '540px',
-              backgroundColor: '#ffffff',
-              borderRadius: '16px',
-              padding: '24px',
-              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)'
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '20px' }}>✏️</span>
-                <h3 style={{ fontSize: '16px', fontWeight: '800', color: '#0f172a', margin: 0 }}>
-                  Edit Camera & RTSP URL Configuration
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowEditModal(false)}
-                style={{ background: 'none', border: 'none', fontSize: '18px', color: '#64748b', cursor: 'pointer' }}
-              >
-                ✕
-              </button>
-            </div>
-
-            <p style={{ fontSize: '12px', color: '#64748b', marginBottom: '16px' }}>
-              Modify the RTSP stream URL, display name, physical location, or attendance role for this camera checkpoint. Changes take effect immediately without restarting the server.
-            </p>
-
-            <form onSubmit={handleSubmitEditCamera}>
-              {/* Select Camera to Edit */}
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Select Camera Checkpoint:
-                </label>
-                <select
-                  value={editCamId}
-                  onChange={(e) => populateEditFields(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    fontWeight: '600',
-                    outline: 'none',
-                    boxSizing: 'border-box',
-                    backgroundColor: '#f8fafc'
-                  }}
-                >
-                  {cameras.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} ({c.id}) — {c.location}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Camera Display Name:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamName}
-                    onChange={(e) => setEditCamName(e.target.value)}
-                    placeholder="e.g. Staff Inbound Entry"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                    required
-                  />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Location / Zone:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamLocation}
-                    onChange={(e) => setEditCamLocation(e.target.value)}
-                    placeholder="e.g. Ground Floor Gate 01"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                  />
-                </div>
-              </div>
-
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Attendance Role:
-                </label>
-                <select
-                  value={editCamRole}
-                  onChange={(e) => setEditCamRole(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    outline: 'none',
-                    boxSizing: 'border-box'
-                  }}
-                >
-                  <option value="entry">Inbound Entry (Daily Check-In & Entry Attendance)</option>
-                  <option value="exit">Check-Out Exit (Daily Check-Out & Final Departure Attendance)</option>
-                  <option value="internal">Internal Ward / Clinic (Transit & Sighting Tracking)</option>
-                  <option value="perimeter">Perimeter / Security (General Access Tracking)</option>
-                </select>
-                <span style={{ fontSize: '11px', color: '#64748b', marginTop: '2px', display: 'block' }}>
-                  {editCamRole === 'exit'
-                    ? "⚠️ Exit role: Sightings at this camera calculate the employee's final check-out and total presence duration."
-                    : 'Sightings at this camera track employee presence and movement.'}
-                </span>
-              </div>
-
-              <div style={{ marginBottom: '16px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
-                  <label style={{ fontSize: '12px', fontWeight: '700', color: '#334155' }}>
-                    RTSP Stream URL:
-                  </label>
-                  <span style={{ fontSize: '11px', color: '#0284c7', fontWeight: '600' }}>
-                    Port: 31554
-                  </span>
-                </div>
-                <input
-                  type="text"
-                  value={editCamRtsp}
-                  onChange={(e) => setEditCamRtsp(e.target.value)}
-                  placeholder="rtsp://124.123.89.162:31554/live/..."
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' }}
-                  required
-                />
-              </div>
-
-              {editError && (
-                <div style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#b91c1c', fontSize: '12px', marginBottom: '14px' }}>
-                  {editError}
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                <button
-                  type="button"
-                  onClick={() => setShowEditModal(false)}
-                  style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '12px', fontWeight: '700', color: '#475569', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submittingEdit}
-                  style={{ padding: '8px 18px', borderRadius: '8px', backgroundColor: '#0f766e', border: 'none', color: '#ffffff', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
-                >
-                  {submittingEdit ? 'Saving Changes...' : 'Save Camera Changes'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* Main Video View Area */}
       {currentViewMode === 'grid' ? (
@@ -1067,16 +993,31 @@ export default function LiveHudFeed({
                 >
                   ✏️ Edit
                 </button>
-                {slot1Camera !== 'main' && (
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteCamera(slot1Camera)}
-                    title="Remove Camera"
-                    style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: '12px' }}
-                  >
-                    🗑
-                  </button>
-                )}
+                {(() => {
+                  const entryCams = cameras.filter((c) => c.role === 'entry');
+                  const isSoleEntry = slot1Obj?.role === 'entry' && entryCams.length <= 1;
+                  if (cameras.length > 1 && !isSoleEntry) {
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteCamera(slot1Camera)}
+                        title="Remove Camera"
+                        style={{
+                          backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                          border: '1px solid rgba(239, 68, 68, 0.3)',
+                          borderRadius: '4px',
+                          color: '#ef4444',
+                          cursor: 'pointer',
+                          fontSize: '11px',
+                          padding: '2px 6px'
+                        }}
+                      >
+                        🗑
+                      </button>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             </div>
 
@@ -1260,16 +1201,31 @@ export default function LiveHudFeed({
                 >
                   ✏️ Edit
                 </button>
-                {slot2Camera !== 'main' && (
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteCamera(slot2Camera)}
-                    title="Remove Camera"
-                    style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: '12px' }}
-                  >
-                    🗑
-                  </button>
-                )}
+                {(() => {
+                  const entryCams = cameras.filter((c) => c.role === 'entry');
+                  const isSoleEntry = slot2Obj?.role === 'entry' && entryCams.length <= 1;
+                  if (cameras.length > 1 && !isSoleEntry) {
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteCamera(slot2Camera)}
+                        title="Remove Camera"
+                        style={{
+                          backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                          border: '1px solid rgba(239, 68, 68, 0.3)',
+                          borderRadius: '4px',
+                          color: '#ef4444',
+                          cursor: 'pointer',
+                          fontSize: '11px',
+                          padding: '2px 6px'
+                        }}
+                      >
+                        🗑
+                      </button>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             </div>
 
@@ -1458,16 +1414,35 @@ export default function LiveHudFeed({
               >
                 ✏️ Edit Camera
               </button>
-              {activeCamera !== 'main' && (
-                <button
-                  type="button"
-                  onClick={() => handleDeleteCamera(activeCamera)}
-                  title="Remove Camera"
-                  style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: '13px' }}
-                >
-                  🗑 Remove Camera
-                </button>
-              )}
+              {(() => {
+                const entryCams = cameras.filter((c) => c.role === 'entry');
+                const isSoleEntry = focusCamObj?.role === 'entry' && entryCams.length <= 1;
+                if (cameras.length > 1 && !isSoleEntry) {
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteCamera(activeCamera)}
+                      title="Remove Camera"
+                      style={{
+                        backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                        border: '1px solid rgba(239, 68, 68, 0.3)',
+                        borderRadius: '6px',
+                        color: '#ef4444',
+                        cursor: 'pointer',
+                        fontSize: '11px',
+                        fontWeight: '700',
+                        padding: '4px 8px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px'
+                      }}
+                    >
+                      🗑 Remove Camera
+                    </button>
+                  );
+                }
+                return null;
+              })()}
             </div>
           </div>
 
@@ -1567,515 +1542,245 @@ export default function LiveHudFeed({
 
 
 
-      {/* Edit Camera Modal */}
-      {showEditModal && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            backgroundColor: 'rgba(15, 23, 42, 0.72)',
-            backdropFilter: 'blur(4px)',
-            zIndex: 99999,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '20px'
-          }}
-          onClick={() => setShowEditModal(false)}
-        >
-          <div
-            className="med-card"
-            style={{
-              width: '100%',
-              maxWidth: '540px',
-              backgroundColor: '#ffffff',
-              borderRadius: '16px',
-              padding: '24px',
-              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)'
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '20px' }}>✏️</span>
-                <h3 style={{ fontSize: '16px', fontWeight: '800', color: '#0f172a', margin: 0 }}>
-                  Edit Camera & RTSP URL Configuration
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowEditModal(false)}
-                style={{ background: 'none', border: 'none', fontSize: '18px', color: '#64748b', cursor: 'pointer' }}
-              >
-                ✕
-              </button>
-            </div>
-
-            <p style={{ fontSize: '12px', color: '#64748b', marginBottom: '16px' }}>
-              Modify the RTSP stream URL, display name, physical location, or attendance role for this camera checkpoint. Changes take effect immediately without restarting the server.
-            </p>
-
-            <form onSubmit={handleSubmitEditCamera}>
-              {/* Select Camera to Edit */}
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Select Camera Checkpoint:
-                </label>
-                <select
-                  value={editCamId}
-                  onChange={(e) => populateEditFields(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    fontWeight: '600',
-                    outline: 'none',
-                    boxSizing: 'border-box',
-                    backgroundColor: '#f8fafc'
-                  }}
-                >
-                  {cameras.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} ({c.id}) — {c.location}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Camera Display Name:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamName}
-                    onChange={(e) => setEditCamName(e.target.value)}
-                    placeholder="e.g. Staff Inbound Entry"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                    required
-                  />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Location / Zone:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamLocation}
-                    onChange={(e) => setEditCamLocation(e.target.value)}
-                    placeholder="e.g. Ground Floor Gate 01"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                  />
-                </div>
-              </div>
-
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Attendance Role:
-                </label>
-                <select
-                  value={editCamRole}
-                  onChange={(e) => setEditCamRole(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    outline: 'none',
-                    boxSizing: 'border-box'
-                  }}
-                >
-                  <option value="entry">Inbound Entry (Daily Check-In & Entry Attendance)</option>
-                  <option value="exit">Check-Out Exit (Daily Check-Out & Final Departure Attendance)</option>
-                  <option value="internal">Internal Ward / Clinic (Transit & Sighting Tracking)</option>
-                  <option value="perimeter">Perimeter / Security (General Access Tracking)</option>
-                </select>
-                <span style={{ fontSize: '11px', color: '#64748b', marginTop: '2px', display: 'block' }}>
-                  {editCamRole === 'exit'
-                    ? "⚠️ Exit role: Sightings at this camera calculate the employee's final check-out and total presence duration."
-                    : 'Sightings at this camera track employee presence and movement.'}
-                </span>
-              </div>
-
-              <div style={{ marginBottom: '16px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
-                  <label style={{ fontSize: '12px', fontWeight: '700', color: '#334155' }}>
-                    RTSP Stream URL:
-                  </label>
-                  <span style={{ fontSize: '11px', color: '#0284c7', fontWeight: '600' }}>
-                    Port: 31554
-                  </span>
-                </div>
-                <input
-                  type="text"
-                  value={editCamRtsp}
-                  onChange={(e) => setEditCamRtsp(e.target.value)}
-                  placeholder="rtsp://124.123.89.162:31554/live/..."
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' }}
-                  required
-                />
-              </div>
-
-              {editError && (
-                <div style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#b91c1c', fontSize: '12px', marginBottom: '14px' }}>
-                  {editError}
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                <button
-                  type="button"
-                  onClick={() => setShowEditModal(false)}
-                  style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '12px', fontWeight: '700', color: '#475569', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submittingEdit}
-                  style={{ padding: '8px 18px', borderRadius: '8px', backgroundColor: '#0f766e', border: 'none', color: '#ffffff', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
-                >
-                  {submittingEdit ? 'Saving Changes...' : 'Save Camera Changes'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* Add Camera Modal */}
-      {showAddModal && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            backgroundColor: 'rgba(15, 23, 42, 0.72)',
-            backdropFilter: 'blur(4px)',
-            zIndex: 99999,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '20px'
-          }}
-          onClick={() => setShowAddModal(false)}
-        >
-          <div
-            className="med-card"
-            style={{
-              width: '100%',
-              maxWidth: '520px',
-              backgroundColor: '#ffffff',
-              borderRadius: '16px',
-              padding: '24px',
-              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)'
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-              <h3 style={{ fontSize: '16px', fontWeight: '800', color: '#0f172a', margin: 0 }}>
-                📹 Add New Hospital Camera Checkpoint
-              </h3>
-              <button
-                type="button"
-                onClick={() => setShowAddModal(false)}
-                style={{ background: 'none', border: 'none', fontSize: '18px', color: '#64748b', cursor: 'pointer' }}
-              >
-                ✕
-              </button>
-            </div>
-
-            <p style={{ fontSize: '12px', color: '#64748b', marginBottom: '16px' }}>
-              Register an RTSP feed to continuously track staff attendance, analyze movement flow, and enforce security across checkpoints.
-            </p>
-
-            {/* Presets */}
-            <div style={{ marginBottom: '16px' }}>
-              <span style={{ fontSize: '11px', fontWeight: '700', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                Quick Presets:
-              </span>
-              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '6px' }}>
-                <button
-                  type="button"
-                  onClick={() =>
-                    handlePresetSelect('Main Porch Outer', 'Outer Entrance Porch', 'rtsp://124.123.89.162:31554/live/main_porch_outer')
-                  }
-                  style={{ padding: '4px 10px', borderRadius: '6px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', cursor: 'pointer' }}
-                >
-                  Outer Porch
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    handlePresetSelect('Reception OPD', 'Ground Floor Lobby', 'rtsp://124.123.89.162:31554/live/reception')
-                  }
-                  style={{ padding: '4px 10px', borderRadius: '6px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', cursor: 'pointer' }}
-                >
-                  Reception Lobby
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    handlePresetSelect('ICU 8 Corridor', 'ICU Ward Corridor 8', 'rtsp://124.123.89.162:31554/live/icu8')
-                  }
-                  style={{ padding: '4px 10px', borderRadius: '6px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', cursor: 'pointer' }}
-                >
-                  ICU Corridor
-                </button>
-              </div>
-            </div>
-
-            <form onSubmit={handleSubmitNewCamera}>
-              <div style={{ marginBottom: '12px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Camera Name:
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Reception Desk Cam"
-                  value={newCamName}
-                  onChange={(e) => setNewCamName(e.target.value)}
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                  required
-                />
-              </div>
-
-              <div style={{ marginBottom: '12px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Hospital Location / Zone:
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. OPD Tower A"
-                  value={newCamLocation}
-                  onChange={(e) => setNewCamLocation(e.target.value)}
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                />
-              </div>
-
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  RTSP Stream URL:
-                </label>
-                <input
-                  type="text"
-                  placeholder="rtsp://124.123.89.162:31554/live/..."
-                  value={newCamRtsp}
-                  onChange={(e) => setNewCamRtsp(e.target.value)}
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' }}
-                  required
-                />
-              </div>
-
-              {addError && (
-                <div style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#b91c1c', fontSize: '12px', marginBottom: '14px' }}>
-                  {addError}
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                <button
-                  type="button"
-                  onClick={() => setShowAddModal(false)}
-                  style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '12px', fontWeight: '700', color: '#475569', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submittingCam}
-                  style={{ padding: '8px 18px', borderRadius: '8px', backgroundColor: '#0284c7', border: 'none', color: '#ffffff', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
-                >
-                  {submittingCam ? 'Adding Pipeline...' : 'Add Camera Pipeline'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      <CameraFormModal
+        isOpen={showAddModal}
+        isEdit={false}
+        onClose={() => setShowAddModal(false)}
+        onSubmit={handleSubmitNewCamera}
+        camName={newCamName}
+        setCamName={setNewCamName}
+        camRole={newCamRole}
+        setCamRole={setNewCamRole}
+        camRtsp={newCamRtsp}
+        setCamRtsp={setNewCamRtsp}
+        submitting={submittingCam}
+        error={addError}
+      />
 
       {/* Edit Camera Modal */}
-      {showEditModal && (
+      <CameraFormModal
+        isOpen={showEditModal}
+        isEdit={true}
+        onClose={() => setShowEditModal(false)}
+        onSubmit={handleSubmitEditCamera}
+        onDeleteCamera={handleDeleteCamera}
+        cameras={cameras}
+        selectedId={editCamId}
+        onSelectCamera={populateEditFields}
+        camName={editCamName}
+        setCamName={setEditCamName}
+        camRole={editCamRole}
+        setCamRole={setEditCamRole}
+        camRtsp={editCamRtsp}
+        setCamRtsp={setEditCamRtsp}
+        submitting={submittingEdit}
+        error={editError}
+      />
+
+      {/* Manage Cameras Hub Modal */}
+      {showManageModal && (
         <div
           style={{
             position: 'fixed',
             inset: 0,
             backgroundColor: 'rgba(15, 23, 42, 0.72)',
             backdropFilter: 'blur(4px)',
-            zIndex: 99999,
+            zIndex: 99998,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
             padding: '20px'
           }}
-          onClick={() => setShowEditModal(false)}
+          onClick={() => setShowManageModal(false)}
         >
           <div
             className="med-card"
             style={{
               width: '100%',
-              maxWidth: '540px',
+              maxWidth: '720px',
               backgroundColor: '#ffffff',
               borderRadius: '16px',
               padding: '24px',
-              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)'
+              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)',
+              maxHeight: '85vh',
+              display: 'flex',
+              flexDirection: 'column'
             }}
             onClick={(e) => e.stopPropagation()}
           >
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '20px' }}>✏️</span>
-                <h3 style={{ fontSize: '16px', fontWeight: '800', color: '#0f172a', margin: 0 }}>
-                  Edit Camera & RTSP URL Configuration
+              <div>
+                <h3 style={{ fontSize: '17px', fontWeight: '800', color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  📹 Registered Hospital Cameras ({cameras.length})
                 </h3>
+                <p style={{ fontSize: '12px', color: '#64748b', margin: '4px 0 0 0' }}>
+                  Manage, edit details, or configure RTSP feeds and attendance roles for each checkpoint.
+                </p>
               </div>
               <button
                 type="button"
-                onClick={() => setShowEditModal(false)}
+                onClick={() => setShowManageModal(false)}
                 style={{ background: 'none', border: 'none', fontSize: '18px', color: '#64748b', cursor: 'pointer' }}
               >
                 ✕
               </button>
             </div>
 
-            <p style={{ fontSize: '12px', color: '#64748b', marginBottom: '16px' }}>
-              Modify the RTSP stream URL, display name, physical location, or attendance role for this camera checkpoint. Changes take effect immediately without restarting the server.
-            </p>
+            <div style={{ overflowY: 'auto', flex: 1, paddingRight: '4px', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {cameras.map((c) => {
+                  const roleNormalized = (c.role || '').toLowerCase();
+                  const isEntry = roleNormalized === 'entry';
+                  const isExit = roleNormalized === 'exit';
+                  const roleBadgeBg = isEntry ? '#ecfdf5' : isExit ? '#f5f3ff' : '#f1f5f9';
+                  const roleBadgeColor = isEntry ? '#059669' : isExit ? '#7c3aed' : '#475569';
+                  const roleLabel = isEntry ? '🟢 Inbound Entry' : isExit ? '🟠 Check-Out Exit' : '🔵 Inwards / Perimeter';
 
-            <form onSubmit={handleSubmitEditCamera}>
-              {/* Select Camera to Edit */}
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Select Camera Checkpoint:
-                </label>
-                <select
-                  value={editCamId}
-                  onChange={(e) => populateEditFields(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    fontWeight: '600',
-                    outline: 'none',
-                    boxSizing: 'border-box',
-                    backgroundColor: '#f8fafc'
-                  }}
-                >
-                  {cameras.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} ({c.id}) — {c.location}
-                    </option>
-                  ))}
-                </select>
+                  return (
+                    <div
+                      key={c.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '12px 14px',
+                        borderRadius: '10px',
+                        border: '1px solid #e2e8f0',
+                        backgroundColor: '#f8fafc',
+                        gap: '12px',
+                        flexWrap: 'wrap'
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: '220px', flex: 1 }}>
+                        <span style={{ fontSize: '20px' }}>📹</span>
+                        <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <b style={{ fontSize: '13px', color: '#0f172a' }}>{c.name}</b>
+                            <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '4px', backgroundColor: roleBadgeBg, color: roleBadgeColor, fontWeight: '700' }}>
+                              {roleLabel}
+                            </span>
+                            {c.id === activeCamera && (
+                              <span style={{ fontSize: '9px', padding: '1px 5px', borderRadius: '4px', backgroundColor: '#e0f2fe', color: '#0369a1', fontWeight: '800' }}>
+                                ACTIVE
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
+                            <span style={{ fontFamily: 'monospace', color: '#475569' }}>{c.rtsp}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontSize: '11px', padding: '3px 8px', borderRadius: '6px', backgroundColor: c.is_connected !== false ? '#ecfdf5' : '#fef3c7', color: c.is_connected !== false ? '#059669' : '#b45309', fontWeight: '700' }}>
+                          {c.is_connected !== false ? '● ONLINE' : '● CONNECTING'} {c.fps ? `(${c.fps} FPS)` : ''}
+                        </span>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowManageModal(false);
+                            handleOpenEditModal(c);
+                          }}
+                          style={{
+                            padding: '5px 10px',
+                            borderRadius: '6px',
+                            backgroundColor: '#ffffff',
+                            border: '1px solid #cbd5e1',
+                            color: '#0f172a',
+                            fontSize: '11px',
+                            fontWeight: '700',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px'
+                          }}
+                        >
+                          ✏️ Edit
+                        </button>
+
+                        {(() => {
+                          const entryCams = cameras.filter((cam) => cam.role === 'entry');
+                          const isSoleEntry = c.role === 'entry' && entryCams.length <= 1;
+                          if (cameras.length <= 1) {
+                            return (
+                              <span style={{ width: '28px', textAlign: 'center', fontSize: '12px', color: '#94a3b8' }} title="At least one camera required">
+                                🔒
+                              </span>
+                            );
+                          }
+                          if (isSoleEntry) {
+                            return (
+                              <span style={{ width: '28px', textAlign: 'center', fontSize: '12px', color: '#b45309' }} title="At least one Entry role camera is required and cannot be deleted">
+                                🔒
+                              </span>
+                            );
+                          }
+                          return (
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteCamera(c.id)}
+                              title={`Remove camera ${c.name}`}
+                              style={{
+                                padding: '5px 10px',
+                                borderRadius: '6px',
+                                backgroundColor: '#fee2e2',
+                                border: '1px solid #fecaca',
+                                color: '#dc2626',
+                                fontSize: '11px',
+                                fontWeight: '700',
+                                cursor: 'pointer'
+                              }}
+                            >
+                              🗑
+                            </button>
+                          );
+                        })()}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
+            </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Camera Display Name:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamName}
-                    onChange={(e) => setEditCamName(e.target.value)}
-                    placeholder="e.g. Staff Inbound Entry"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                    required
-                  />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                    Location / Zone:
-                  </label>
-                  <input
-                    type="text"
-                    value={editCamLocation}
-                    onChange={(e) => setEditCamLocation(e.target.value)}
-                    placeholder="e.g. Ground Floor Gate 01"
-                    style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
-                  />
-                </div>
-              </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid #e2e8f0', paddingTop: '14px' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowManageModal(false);
+                  handleOpenAddModal();
+                }}
+                style={{
+                  padding: '7px 14px',
+                  borderRadius: '8px',
+                  backgroundColor: '#0284c7',
+                  border: 'none',
+                  color: '#ffffff',
+                  fontSize: '12px',
+                  fontWeight: '700',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px'
+                }}
+              >
+                <span>+</span> Add Another Camera Checkpoint
+              </button>
 
-              <div style={{ marginBottom: '14px' }}>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '700', color: '#334155', marginBottom: '4px' }}>
-                  Attendance Role:
-                </label>
-                <select
-                  value={editCamRole}
-                  onChange={(e) => setEditCamRole(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '13px',
-                    outline: 'none',
-                    boxSizing: 'border-box'
-                  }}
-                >
-                  <option value="entry">Inbound Entry (Daily Check-In & Entry Attendance)</option>
-                  <option value="exit">Check-Out Exit (Daily Check-Out & Final Departure Attendance)</option>
-                  <option value="internal">Internal Ward / Clinic (Transit & Sighting Tracking)</option>
-                  <option value="perimeter">Perimeter / Security (General Access Tracking)</option>
-                </select>
-                <span style={{ fontSize: '11px', color: '#64748b', marginTop: '2px', display: 'block' }}>
-                  {editCamRole === 'exit'
-                    ? "⚠️ Exit role: Sightings at this camera calculate the employee's final check-out and total presence duration."
-                    : 'Sightings at this camera track employee presence and movement.'}
-                </span>
-              </div>
-
-              <div style={{ marginBottom: '16px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
-                  <label style={{ fontSize: '12px', fontWeight: '700', color: '#334155' }}>
-                    RTSP Stream URL:
-                  </label>
-                  <span style={{ fontSize: '11px', color: '#0284c7', fontWeight: '600' }}>
-                    Port: 31554
-                  </span>
-                </div>
-                <input
-                  type="text"
-                  value={editCamRtsp}
-                  onChange={(e) => setEditCamRtsp(e.target.value)}
-                  placeholder="rtsp://124.123.89.162:31554/live/..."
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', fontFamily: 'monospace', outline: 'none', boxSizing: 'border-box' }}
-                  required
-                />
-              </div>
-
-              {editError && (
-                <div style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#b91c1c', fontSize: '12px', marginBottom: '14px' }}>
-                  {editError}
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                <button
-                  type="button"
-                  onClick={() => setShowEditModal(false)}
-                  style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '12px', fontWeight: '700', color: '#475569', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submittingEdit}
-                  style={{ padding: '8px 18px', borderRadius: '8px', backgroundColor: '#0f766e', border: 'none', color: '#ffffff', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
-                >
-                  {submittingEdit ? 'Saving Changes...' : 'Save Camera Changes'}
-                </button>
-              </div>
-            </form>
+              <button
+                type="button"
+                onClick={() => setShowManageModal(false)}
+                style={{ padding: '7px 16px', borderRadius: '8px', backgroundColor: '#f1f5f9', border: '1px solid #cbd5e1', fontSize: '12px', fontWeight: '700', color: '#475569', cursor: 'pointer' }}
+              >
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}
+
     </div>
   );
 }

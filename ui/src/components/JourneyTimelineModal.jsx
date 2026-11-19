@@ -76,6 +76,15 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
   const [customEnd, setCustomEnd] = useState(() => getTodayDateStr());
   const [selectedCropIdx, setSelectedCropIdx] = useState(0);
   const [previewImg, setPreviewImg] = useState(null);
+  const [expandedDays, setExpandedDays] = useState(() => ({ [getTodayDateStr()]: true }));
+
+  useEffect(() => {
+    const today = getTodayDateStr();
+    setExpandedDays(prev => ({
+      ...prev,
+      [today]: true
+    }));
+  }, [dateFilter, journey]);
 
   useEffect(() => {
     if (!isOpen || !visitorId) {
@@ -158,8 +167,13 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
     let totalMins = 0;
 
     filteredDailyHistory.forEach((rec) => {
-      inCnt += rec.in_count ?? 1;
-      outCnt += rec.out_count ?? (rec.is_checkout_verified ? 1 : 0);
+      // Checkpoint events count for this specific day
+      const dayCps = allCheckpoints.filter(c => c.timestamp && c.timestamp.startsWith(rec.date));
+      const cIns = dayCps.filter(c => c.event_type === 'IN').length;
+      const cOuts = dayCps.filter(c => c.event_type === 'OUT').length;
+
+      inCnt += Math.max(rec.in_count ?? 1, cIns || 1);
+      outCnt += Math.max(rec.out_count ?? (rec.is_checkout_verified ? 1 : 0), cOuts);
       totalMins += rec.duration_minutes || 0;
     });
 
@@ -169,6 +183,11 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
     if (cpIn > 0 || cpOut > 0) {
       inCnt = Math.max(inCnt, cpIn);
       outCnt = Math.max(outCnt, cpOut);
+    }
+
+    // If journey or employee has live duty minutes for today
+    if (journey?.today_duration_mins && (dateFilter === 'today' || dateRange.id === 'today')) {
+      totalMins = Math.max(totalMins, journey.today_duration_mins);
     }
 
     const th = Math.floor(totalMins / 60);
@@ -182,7 +201,112 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
       totalMovements: inCnt + outCnt,
       totalDurationStr: durStr
     };
-  }, [filteredDailyHistory, filteredCheckpoints]);
+  }, [filteredDailyHistory, filteredCheckpoints, allCheckpoints, journey, dateFilter, dateRange]);
+
+  // Group checkpoints by day (date: 'YYYY-MM-DD')
+  const checkpointsByDay = useMemo(() => {
+    if (!filteredCheckpoints || filteredCheckpoints.length === 0) return [];
+
+    const groups = {};
+    filteredCheckpoints.forEach((cp) => {
+      const ts = cp.timestamp || '';
+      const dateStr = ts.slice(0, 10) || 'Unknown';
+      if (!groups[dateStr]) {
+        groups[dateStr] = [];
+      }
+      groups[dateStr].push(cp);
+    });
+
+    // Sort descending by date (latest date first: e.g. Today, Yesterday)
+    const sortedDates = Object.keys(groups).sort((a, b) => b.localeCompare(a));
+    const todayStr = getTodayDateStr();
+    const yesterdayStr = getNDaysAgoStr(1);
+
+    return sortedDates.map((dStr) => {
+      const rawCps = groups[dStr];
+      const dailyRec = filteredDailyHistory.find((r) => r.date === dStr);
+
+      let dayPrevTime = null;
+      const cpsWithTransit = rawCps.map((cp, idx) => {
+        let transitMins = 0;
+        try {
+          const currDt = new Date(cp.timestamp);
+          if (dayPrevTime) {
+            transitMins = Math.max(1, Math.round((currDt - dayPrevTime) / 60000));
+          }
+          dayPrevTime = currDt;
+        } catch (e) {
+          transitMins = 0;
+        }
+        return {
+          ...cp,
+          dayIdx: idx + 1,
+          transit_mins: transitMins,
+          is_first_of_day: idx === 0
+        };
+      });
+
+      const cIns = cpsWithTransit.filter((c) => c.event_type === 'IN').length;
+      const cOuts = cpsWithTransit.filter((c) => c.event_type === 'OUT').length;
+      const inVal = Math.max(dailyRec?.in_count ?? 1, cIns || 1);
+      const outVal = Math.max(dailyRec?.out_count ?? (dailyRec?.is_checkout_verified ? 1 : 0), cOuts);
+
+      let dayLabel = dStr;
+      let daySub = '';
+      try {
+        const [y, m, d] = dStr.split('-').map(Number);
+        const dt = new Date(y, m - 1, d);
+        if (dStr === todayStr) {
+          dayLabel = 'Today';
+          daySub = dt.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+        } else if (dStr === yesterdayStr) {
+          dayLabel = 'Yesterday';
+          daySub = dt.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+        } else {
+          dayLabel = dt.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+          daySub = dt.toLocaleDateString('en-IN', { year: 'numeric' });
+        }
+      } catch (e) {
+        dayLabel = dStr;
+      }
+
+      const durStr = (dStr === todayStr && journey?.today_duration_str)
+        ? journey.today_duration_str
+        : (dailyRec?.duration_str || (dailyRec?.duration_minutes ? `${dailyRec.duration_minutes}m` : null));
+
+      const isOngoing = dStr === todayStr && (journey?.today_status === 'IN HOSPITAL' || !dailyRec?.is_checkout_verified);
+
+      return {
+        date: dStr,
+        dayLabel,
+        daySub,
+        isToday: dStr === todayStr,
+        checkpoints: cpsWithTransit,
+        inCount: inVal,
+        outCount: outVal,
+        durationStr: durStr,
+        isOngoing,
+        status: isOngoing ? 'On Duty' : 'Completed'
+      };
+    });
+  }, [filteredCheckpoints, filteredDailyHistory, journey]);
+
+  const toggleDay = (dateStr) => {
+    setExpandedDays((prev) => ({
+      ...prev,
+      [dateStr]: !prev[dateStr]
+    }));
+  };
+
+  const expandAllDays = () => {
+    const all = {};
+    checkpointsByDay.forEach((d) => { all[d.date] = true; });
+    setExpandedDays(all);
+  };
+
+  const collapseAllDays = () => {
+    setExpandedDays({});
+  };
 
   if (!isOpen) return null;
 
@@ -617,12 +741,13 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
                       <th style={{ padding: '10px 14px', fontWeight: '800' }}>Hospital Duration</th>
                       <th style={{ padding: '10px 14px', fontWeight: '800' }}>In & Out Count</th>
                       <th style={{ padding: '10px 14px', fontWeight: '800' }}>Status</th>
+                      <th style={{ padding: '10px 14px', fontWeight: '800' }}>Journey Track</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filteredDailyHistory.length === 0 ? (
                       <tr>
-                        <td colSpan="6" style={{ padding: '32px', textAlign: 'center', color: '#94a3b8' }}>
+                        <td colSpan="7" style={{ padding: '32px', textAlign: 'center', color: '#94a3b8' }}>
                           No attendance records found for {dateRange.label}.
                         </td>
                       </tr>
@@ -673,9 +798,20 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
                               fontSize: '11px',
                               fontWeight: '700'
                             }}>
-                              <span style={{ color: '#15803d' }}>{rec.in_count ?? 1} In</span>
-                              <span style={{ color: '#94a3b8' }}>/</span>
-                              <span style={{ color: '#b45309' }}>{rec.out_count ?? (rec.is_checkout_verified ? 1 : 0)} Out</span>
+                              {(() => {
+                                const dayCps = allCheckpoints.filter(c => c.timestamp && c.timestamp.startsWith(rec.date));
+                                const cIns = dayCps.filter(c => c.event_type === 'IN').length;
+                                const cOuts = dayCps.filter(c => c.event_type === 'OUT').length;
+                                const inVal = Math.max(rec.in_count ?? 1, cIns || 1);
+                                const outVal = Math.max(rec.out_count ?? (rec.is_checkout_verified ? 1 : 0), cOuts);
+                                return (
+                                  <>
+                                    <span style={{ color: '#15803d' }}>{inVal} In</span>
+                                    <span style={{ color: '#94a3b8' }}>/</span>
+                                    <span style={{ color: '#b45309' }}>{outVal} Out</span>
+                                  </>
+                                );
+                              })()}
                             </span>
                           </td>
                           <td style={{ padding: '10px 14px' }}>
@@ -703,6 +839,31 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
                               </span>
                             )}
                           </td>
+                          <td style={{ padding: '10px 14px', whiteSpace: 'nowrap' }}>
+                            <button
+                              onClick={() => {
+                                setActiveTab('camera_journey');
+                                setExpandedDays({ [rec.date]: true });
+                              }}
+                              style={{
+                                padding: '4px 10px',
+                                fontSize: '11px',
+                                fontWeight: '700',
+                                borderRadius: '6px',
+                                border: '1px solid #bae6fd',
+                                backgroundColor: '#f0f9ff',
+                                color: '#0284c7',
+                                cursor: 'pointer',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '4px'
+                              }}
+                              title={`View passage timeline for ${rec.date}`}
+                            >
+                              <span>View Journey</span>
+                              <span>➔</span>
+                            </button>
+                          </td>
                         </tr>
                       ))
                     )}
@@ -711,188 +872,355 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
               </div>
             </div>
           ) : (
-            /* Tab 2: Chronological Sightings & Camera Passages */
+            /* Tab 2: Chronological Sightings & Camera Passages Grouped By Day */
             <div>
-              <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '16px' }}>
-                Chronological camera passages, arrivals, exits, and verified checkpoints for <strong>{dateRange.label}</strong>.
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px', flexWrap: 'wrap', gap: '8px' }}>
+                <div style={{ fontSize: '12px', color: '#64748b' }}>
+                  Showing chronological camera passages separated by day for <strong>{dateRange.label}</strong> ({checkpointsByDay.length} {checkpointsByDay.length === 1 ? 'Day' : 'Days'}). Click any day to view or hide its journey checkpoints.
+                </div>
+                {checkpointsByDay.length > 1 && (
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      onClick={expandAllDays}
+                      style={{
+                        padding: '4px 10px',
+                        fontSize: '11px',
+                        fontWeight: '700',
+                        borderRadius: '6px',
+                        border: '1px solid #cbd5e1',
+                        backgroundColor: '#ffffff',
+                        color: '#0369a1',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Expand All Days
+                    </button>
+                    <button
+                      onClick={collapseAllDays}
+                      style={{
+                        padding: '4px 10px',
+                        fontSize: '11px',
+                        fontWeight: '700',
+                        borderRadius: '6px',
+                        border: '1px solid #cbd5e1',
+                        backgroundColor: '#ffffff',
+                        color: '#64748b',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Collapse All Days
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {filteredCheckpoints.length === 0 ? (
+              {checkpointsByDay.length === 0 ? (
                 <div style={{ padding: '32px', textAlign: 'center', color: '#94a3b8' }}>
                   No camera crossings detected for {dateRange.label}.
                 </div>
               ) : (
-                <div style={{ position: 'relative', paddingLeft: '32px' }}>
-                  {/* Vertical spine */}
-                  <div style={{
-                    position: 'absolute',
-                    left: '11px',
-                    top: '12px',
-                    bottom: '12px',
-                    width: '2px',
-                    backgroundColor: '#cbd5e1'
-                  }} />
-
-                  {filteredCheckpoints.map((cp, idx) => {
-                    const isExit = cp.event_type === 'OUT' || String(cp.camera_name || cp.camera_id).toLowerCase().includes('exit');
-                    const isEntry = cp.event_type === 'IN' || String(cp.camera_name || cp.camera_id).toLowerCase().includes('entry') || idx === 0;
+                <div>
+                  {checkpointsByDay.map((dayGroup) => {
+                    const isExpanded = Boolean(expandedDays[dayGroup.date]);
+                    const isToday = dayGroup.isToday;
 
                     return (
-                      <div key={idx} style={{ position: 'relative', marginBottom: '18px' }}>
-                        {/* Node icon dot */}
-                        <div style={{
-                          position: 'absolute',
-                          left: '-32px',
-                          top: '4px',
-                          width: '24px',
-                          height: '24px',
-                          borderRadius: '50%',
-                          backgroundColor: isExit ? '#f59e0b' : isEntry ? '#10b981' : '#0284c7',
-                          border: '3px solid #ffffff',
-                          boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          color: '#ffffff',
-                          fontSize: '11px',
-                          fontWeight: '800'
-                        }}>
-                          {idx + 1}
-                        </div>
+                      <div
+                        key={dayGroup.date}
+                        style={{
+                          marginBottom: '16px',
+                          border: isToday ? '1.5px solid #0284c7' : '1px solid #e2e8f0',
+                          borderRadius: '12px',
+                          backgroundColor: '#ffffff',
+                          overflow: 'hidden',
+                          boxShadow: isToday ? '0 2px 8px rgba(2, 132, 199, 0.08)' : '0 1px 3px rgba(0,0,0,0.03)'
+                        }}
+                      >
+                        {/* Day Header Row / Accordion Trigger */}
+                        <div
+                          onClick={() => toggleDay(dayGroup.date)}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '12px 18px',
+                            backgroundColor: isToday ? '#f0f9ff' : '#f8fafc',
+                            cursor: 'pointer',
+                            userSelect: 'none',
+                            borderBottom: isExpanded ? '1px solid #e2e8f0' : 'none',
+                            transition: 'background-color 0.15s'
+                          }}
+                        >
+                          {/* Left: Day Label, Date & Sightings Count */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                            <span style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              width: '26px',
+                              height: '26px',
+                              borderRadius: '6px',
+                              backgroundColor: isToday ? '#0284c7' : '#e2e8f0',
+                              color: isToday ? '#ffffff' : '#475569',
+                              fontSize: '11px',
+                              fontWeight: '800'
+                            }}>
+                              {isExpanded ? '▼' : '▶'}
+                            </span>
+                            <div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <span style={{ fontSize: '14px', fontWeight: '800', color: '#0f172a' }}>
+                                  {dayGroup.dayLabel}
+                                </span>
+                                <span style={{ fontSize: '11px', color: '#64748b' }}>
+                                  {dayGroup.daySub}
+                                </span>
+                                {isToday && (
+                                  <span style={{ fontSize: '9px', fontWeight: '800', color: '#0284c7', backgroundColor: '#e0f2fe', padding: '1px 6px', borderRadius: '4px' }}>
+                                    ACTIVE TODAY
+                                  </span>
+                                )}
+                              </div>
+                              <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
+                                {dayGroup.checkpoints.length} Camera {dayGroup.checkpoints.length === 1 ? 'Passage' : 'Passages'} Detected
+                              </div>
+                            </div>
+                          </div>
 
-                        {/* Checkpoint row card */}
-                        <div style={{
-                          backgroundColor: '#f8fafc',
-                          border: '1px solid #e2e8f0',
-                          borderRadius: '10px',
-                          padding: '12px 16px',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: '16px'
-                        }}>
-                          <div style={{ flex: 1 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-                              <span style={{ fontSize: '13px', fontWeight: '800', color: '#0f172a' }}>
-                                {cp.camera_name}
+                          {/* Right: Metrics & Toggle Button */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <span style={{ fontSize: '11px', fontWeight: '700', color: '#15803d', backgroundColor: '#dcfce7', padding: '2px 8px', borderRadius: '5px' }}>
+                              🟢 {dayGroup.inCount} In
+                            </span>
+                            <span style={{ fontSize: '11px', fontWeight: '700', color: '#b45309', backgroundColor: '#fef3c7', padding: '2px 8px', borderRadius: '5px' }}>
+                              🟠 {dayGroup.outCount} Out
+                            </span>
+                            {dayGroup.durationStr && (
+                              <span style={{ fontSize: '11px', fontWeight: '700', color: '#6d28d9', backgroundColor: '#f3e8ff', padding: '2px 8px', borderRadius: '5px' }}>
+                                ⏱ {dayGroup.durationStr}
                               </span>
-                              {isExit ? (
-                                <span style={{ fontSize: '10px', fontWeight: '800', backgroundColor: '#fef3c7', color: '#b45309', padding: '1px 6px', borderRadius: '4px' }}>
-                                  🟠 CHECK-OUT (EXIT)
-                                </span>
-                              ) : isEntry ? (
-                                <span style={{ fontSize: '10px', fontWeight: '800', backgroundColor: '#ecfdf5', color: '#047857', padding: '1px 6px', borderRadius: '4px' }}>
-                                  🟢 CHECK-IN (ENTRY)
-                                </span>
-                              ) : (
-                                <span style={{ fontSize: '10px', fontWeight: '800', backgroundColor: '#e0f2fe', color: '#0369a1', padding: '1px 6px', borderRadius: '4px' }}>
-                                  🔵 TRANSIT
-                                </span>
-                              )}
-                            </div>
-
-                            <div style={{ fontSize: '11px', color: '#64748b' }}>
-                              Location: <strong>{cp.location}</strong>
-                            </div>
-
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginTop: '4px', fontSize: '11px', color: '#64748b' }}>
-                              <span>Timestamp: <strong>{cp.time_display || formatDateTimeIST(cp.timestamp)}</strong></span>
-                              {cp.dwell_mins_since_prev > 0 && (
-                                <span>Transit / Dwell: <strong>{cp.dwell_mins_since_prev} mins</strong></span>
-                              )}
-                              <span>Biometric Match: <strong>{cp.confidence || 98.5}%</strong></span>
-                            </div>
-                          </div>
-
-                          {/* Human Verification Biometric Images */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
-                            {/* 1. Verified Face Capture */}
-                            {(() => {
-                              const faceImg = cp.face_b64 || cp.photo_b64 || crops[idx % Math.max(1, crops.length)] || activeCrop;
-                              if (!faceImg) return null;
-                              const src = faceImg.startsWith('data:') ? faceImg : `data:image/jpeg;base64,${faceImg}`;
-                              return (
-                                <div
-                                  onClick={() => setPreviewImg({
-                                    src,
-                                    title: `${cp.camera_name} • Face Capture`,
-                                    meta: `${cp.time_display || formatDateTimeIST(cp.timestamp)} • Biometric Match ${cp.confidence || 98.5}%`
-                                  })}
-                                  style={{
-                                    display: 'flex',
-                                    flexDirection: 'column',
-                                    alignItems: 'center',
-                                    gap: '3px',
-                                    cursor: 'pointer'
-                                  }}
-                                  title="Click to zoom facial capture for human verification"
-                                >
-                                  <div style={{
-                                    width: '56px',
-                                    height: '56px',
-                                    borderRadius: '10px',
-                                    overflow: 'hidden',
-                                    border: '2px solid #0284c7',
-                                    boxShadow: '0 2px 4px rgba(2, 132, 199, 0.2)',
-                                    backgroundColor: '#e0f2fe',
-                                    position: 'relative'
-                                  }}>
-                                    <img
-                                      src={src}
-                                      alt="Face Capture"
-                                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                                    />
-                                  </div>
-                                  <span style={{ fontSize: '9px', fontWeight: '800', color: '#0369a1', letterSpacing: '0.3px' }}>
-                                    FACE CROP
-                                  </span>
-                                </div>
-                              );
-                            })()}
-
-                            {/* 2. CCTV Torso / Outfit Capture */}
-                            {(() => {
-                              const bodyImg = cp.body_b64;
-                              if (!bodyImg || bodyImg === cp.face_b64) return null;
-                              const src = bodyImg.startsWith('data:') ? bodyImg : `data:image/jpeg;base64,${bodyImg}`;
-                              return (
-                                <div
-                                  onClick={() => setPreviewImg({
-                                    src,
-                                    title: `${cp.camera_name} • Torso / Outfit Footage`,
-                                    meta: `${cp.time_display || formatDateTimeIST(cp.timestamp)}`
-                                  })}
-                                  style={{
-                                    display: 'flex',
-                                    flexDirection: 'column',
-                                    alignItems: 'center',
-                                    gap: '3px',
-                                    cursor: 'pointer'
-                                  }}
-                                  title="Click to zoom CCTV torso/outfit footage"
-                                >
-                                  <div style={{
-                                    width: '44px',
-                                    height: '56px',
-                                    borderRadius: '8px',
-                                    overflow: 'hidden',
-                                    border: '1px solid #cbd5e1',
-                                    backgroundColor: '#f1f5f9'
-                                  }}>
-                                    <img
-                                      src={src}
-                                      alt="Outfit Capture"
-                                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                                    />
-                                  </div>
-                                  <span style={{ fontSize: '9px', fontWeight: '700', color: '#64748b' }}>
-                                    OUTFIT
-                                  </span>
-                                </div>
-                              );
-                            })()}
+                            )}
+                            <span style={{
+                              fontSize: '11px',
+                              fontWeight: '700',
+                              padding: '2px 8px',
+                              borderRadius: '5px',
+                              backgroundColor: dayGroup.status === 'On Duty' ? '#ecfdf5' : '#f1f5f9',
+                              color: dayGroup.status === 'On Duty' ? '#047857' : '#64748b'
+                            }}>
+                              {dayGroup.status === 'On Duty' ? '● On Duty' : '✓ Completed'}
+                            </span>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleDay(dayGroup.date);
+                              }}
+                              style={{
+                                border: '1px solid #cbd5e1',
+                                backgroundColor: isExpanded ? '#0284c7' : '#ffffff',
+                                color: isExpanded ? '#ffffff' : '#0369a1',
+                                fontSize: '11px',
+                                fontWeight: '700',
+                                padding: '4px 10px',
+                                borderRadius: '6px',
+                                cursor: 'pointer',
+                                marginLeft: '4px'
+                              }}
+                            >
+                              {isExpanded ? 'Hide Journey ▲' : 'View Journey ▼'}
+                            </button>
                           </div>
                         </div>
+
+                        {/* Expanded Journey Timeline for This Specific Day */}
+                        {isExpanded && (
+                          <div style={{ padding: '20px 20px 10px 48px', position: 'relative', backgroundColor: '#ffffff' }}>
+                            {/* Vertical spine specifically for this day */}
+                            <div style={{
+                              position: 'absolute',
+                              left: '28px',
+                              top: '24px',
+                              bottom: '24px',
+                              width: '2px',
+                              backgroundColor: '#cbd5e1'
+                            }} />
+
+                            {dayGroup.checkpoints.map((cp, idx) => {
+                              const isExit = cp.event_type === 'OUT';
+                              const isEntry = cp.event_type === 'IN';
+
+                              return (
+                                <div key={idx} style={{ position: 'relative', marginBottom: '18px' }}>
+                                  {/* Node icon dot numbered 1, 2, 3 specifically for this day! */}
+                                  <div style={{
+                                    position: 'absolute',
+                                    left: '-32px',
+                                    top: '4px',
+                                    width: '24px',
+                                    height: '24px',
+                                    borderRadius: '50%',
+                                    backgroundColor: isExit ? '#f59e0b' : isEntry ? '#10b981' : '#0284c7',
+                                    border: '3px solid #ffffff',
+                                    boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    color: '#ffffff',
+                                    fontSize: '11px',
+                                    fontWeight: '800'
+                                  }}>
+                                    {cp.dayIdx || (idx + 1)}
+                                  </div>
+
+                                  {/* Checkpoint row card */}
+                                  <div style={{
+                                    backgroundColor: '#f8fafc',
+                                    border: '1px solid #e2e8f0',
+                                    borderRadius: '10px',
+                                    padding: '12px 16px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'space-between',
+                                    gap: '16px'
+                                  }}>
+                                    <div style={{ flex: 1 }}>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                                        <span style={{ fontSize: '13px', fontWeight: '800', color: '#0f172a' }}>
+                                          {cp.camera_name}
+                                        </span>
+                                        {isExit ? (
+                                          <span style={{ fontSize: '10px', fontWeight: '800', backgroundColor: '#fef3c7', color: '#b45309', padding: '1px 6px', borderRadius: '4px' }}>
+                                            🟠 CHECK-OUT (EXIT)
+                                          </span>
+                                        ) : isEntry ? (
+                                          <span style={{ fontSize: '10px', fontWeight: '800', backgroundColor: '#ecfdf5', color: '#047857', padding: '1px 6px', borderRadius: '4px' }}>
+                                            🟢 CHECK-IN (ENTRY)
+                                          </span>
+                                        ) : (
+                                          <span style={{ fontSize: '10px', fontWeight: '800', backgroundColor: '#e0f2fe', color: '#0369a1', padding: '1px 6px', borderRadius: '4px' }}>
+                                            🔵 INWARDS SPOTTED
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      <div style={{ fontSize: '11px', color: '#64748b' }}>
+                                        Location: <strong>{cp.location}</strong>
+                                      </div>
+
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginTop: '4px', fontSize: '11px', color: '#64748b', flexWrap: 'wrap' }}>
+                                        <span>Time: <strong>{cp.time_display || formatDateTimeIST(cp.timestamp)}</strong></span>
+                                        {cp.dwell_mins > 1 ? (
+                                          <span>Station Dwell: <strong style={{ color: '#0369a1' }}>{cp.dwell_mins} mins</strong></span>
+                                        ) : (
+                                          <span>Station Dwell: <strong>&lt; 1 min</strong></span>
+                                        )}
+                                        {idx > 0 && cp.transit_mins > 0 ? (
+                                          <span style={{ color: '#475569' }}>
+                                            Transit Gap: <strong style={{ color: '#64748b' }}>{cp.transit_mins} mins</strong>
+                                          </span>
+                                        ) : idx === 0 ? (
+                                          <span style={{ color: '#047857', fontWeight: '700', backgroundColor: '#ecfdf5', padding: '1px 6px', borderRadius: '4px' }}>
+                                            🌅 Day Arrival • Check-In
+                                          </span>
+                                        ) : null}
+                                        <span>Biometric Match: <strong>{cp.confidence || 98.5}%</strong></span>
+                                      </div>
+                                    </div>
+
+                                    {/* Human Verification Biometric Images */}
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
+                                      {/* 1. Verified Face Capture */}
+                                      {(() => {
+                                        const faceImg = cp.face_b64 || cp.photo_b64 || crops[idx % Math.max(1, crops.length)] || activeCrop;
+                                        if (!faceImg) return null;
+                                        const src = faceImg.startsWith('data:') ? faceImg : `data:image/jpeg;base64,${faceImg}`;
+                                        return (
+                                          <div
+                                            onClick={() => setPreviewImg({
+                                              src,
+                                              title: `${cp.camera_name} • Face Capture`,
+                                              meta: `${cp.time_display || formatDateTimeIST(cp.timestamp)} • Biometric Match ${cp.confidence || 98.5}%`
+                                            })}
+                                            style={{
+                                              display: 'flex',
+                                              flexDirection: 'column',
+                                              alignItems: 'center',
+                                              gap: '3px',
+                                              cursor: 'pointer'
+                                            }}
+                                            title="Click to zoom facial capture for human verification"
+                                          >
+                                            <div style={{
+                                              width: '56px',
+                                              height: '56px',
+                                              borderRadius: '10px',
+                                              overflow: 'hidden',
+                                              border: '2px solid #0284c7',
+                                              boxShadow: '0 2px 4px rgba(2, 132, 199, 0.2)',
+                                              backgroundColor: '#e0f2fe',
+                                              position: 'relative'
+                                            }}>
+                                              <img
+                                                src={src}
+                                                alt="Face Capture"
+                                                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                              />
+                                            </div>
+                                            <span style={{ fontSize: '9px', fontWeight: '800', color: '#0369a1', letterSpacing: '0.3px' }}>
+                                              FACE CROP
+                                            </span>
+                                          </div>
+                                        );
+                                      })()}
+
+                                      {/* 2. CCTV Torso / Outfit Capture */}
+                                      {(() => {
+                                        const bodyImg = cp.body_b64;
+                                        if (!bodyImg || bodyImg === cp.face_b64) return null;
+                                        const src = bodyImg.startsWith('data:') ? bodyImg : `data:image/jpeg;base64,${bodyImg}`;
+                                        return (
+                                          <div
+                                            onClick={() => setPreviewImg({
+                                              src,
+                                              title: `${cp.camera_name} • Torso / Outfit Footage`,
+                                              meta: `${cp.time_display || formatDateTimeIST(cp.timestamp)}`
+                                            })}
+                                            style={{
+                                              display: 'flex',
+                                              flexDirection: 'column',
+                                              alignItems: 'center',
+                                              gap: '3px',
+                                              cursor: 'pointer'
+                                            }}
+                                            title="Click to zoom CCTV torso/outfit footage"
+                                          >
+                                            <div style={{
+                                              width: '44px',
+                                              height: '56px',
+                                              borderRadius: '8px',
+                                              overflow: 'hidden',
+                                              border: '1px solid #cbd5e1',
+                                              backgroundColor: '#f1f5f9'
+                                            }}>
+                                              <img
+                                                src={src}
+                                                alt="Outfit Capture"
+                                                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                              />
+                                            </div>
+                                            <span style={{ fontSize: '9px', fontWeight: '700', color: '#64748b' }}>
+                                              OUTFIT
+                                            </span>
+                                          </div>
+                                        );
+                                      })()}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}

@@ -1,5 +1,5 @@
-import os
 import sys
+import os
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -339,7 +339,7 @@ class CameraStreamPipeline:
         self.proc = None
 
         det_path = str(MODELS / 'face_detection_yunet_2023mar.onnx')
-        self.detector = cv2.FaceDetectorYN_create(det_path, '', (960, 540), 0.45, 0.3, 1000) if os.path.exists(det_path) else None
+        self.detector = cv2.FaceDetectorYN_create(det_path, '', (720, 405), 0.45, 0.3, 1000) if os.path.exists(det_path) else None
 
         # Start capture and processing threads for this camera
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
@@ -752,7 +752,7 @@ class CameraStreamPipeline:
 
         matched_track_ids = set()
 
-        is_exit_camera = (getattr(self, 'role', 'entry') == 'exit') or ('exit' in self.camera_id.lower()) or ('exit' in self.name.lower())
+        is_exit_camera = (getattr(self, 'role', None) == 'exit') if getattr(self, 'role', None) else ('exit' in self.camera_id.lower() or 'exit' in self.name.lower())
 
         for face in faces:
             x, y, w, h = [int(v) for v in face[:4]]
@@ -844,26 +844,36 @@ class CameraStreamPipeline:
                 trk['history'].append((now_epoch, sx + sw / 2.0, sy + sh / 2.0, sw, sh, (sx, sy, sw, sh)))
                 matched_track_ids.add(track_id)
 
-                # Periodic Keyframe Crop Update (Only once every 20 seconds, zero cost on regular frames)
-                if (now_epoch - trk.get('last_crop_epoch', 0)) >= 20.0 and face_crop is not None and face_crop.size > 0:
-                    is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
-                    if is_sharp and quality_score >= 32.0 and det_score >= 0.78:
-                        vis_id = trk.get('visitor_id')
-                        if vis_id and vis_id in self.engine.unique_cache_by_id:
-                            v_obj = self.engine.unique_cache_by_id[vis_id]
-                            crops = v_obj.get('crops', [])
-                            if not isinstance(crops, list):
-                                crops = [crops] if crops else []
-                            if len(crops) < 8:
-                                ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                                if ok:
-                                    face_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
-                                    if face_b64 not in crops:
-                                        crops.append(face_b64)
-                                        v_obj['crops'] = crops[:8]
-                                        trk['last_crop_epoch'] = now_epoch
-                                        self.engine.async_db_execute('UPDATE unique_visitors SET crops_json = ?, last_seen = ? WHERE id = ?', (json.dumps(crops[:8]), now_iso, vis_id))
-                continue
+                cur_vid = trk.get('visitor_id')
+                is_unresolved = not cur_vid or cur_vid in ('UNREGISTERED', 'UNTRACKED_EXIT')
+
+                if not is_unresolved:
+                    # Periodic Keyframe Crop Update (Only once every 20 seconds, zero cost on regular frames)
+                    if (now_epoch - trk.get('last_crop_epoch', 0)) >= 20.0 and face_crop is not None and face_crop.size > 0:
+                        is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
+                        if is_sharp and quality_score >= 32.0 and det_score >= 0.78:
+                            vis_id = trk.get('visitor_id')
+                            if vis_id and vis_id in self.engine.unique_cache_by_id:
+                                v_obj = self.engine.unique_cache_by_id[vis_id]
+                                crops = v_obj.get('crops', [])
+                                if not isinstance(crops, list):
+                                    crops = [crops] if crops else []
+                                if len(crops) < 8:
+                                    ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                                    if ok:
+                                        face_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+                                        if face_b64 not in crops:
+                                            crops.append(face_b64)
+                                            v_obj['crops'] = crops[:8]
+                                            trk['last_crop_epoch'] = now_epoch
+                                            self.engine.async_db_execute('UPDATE unique_visitors SET crops_json = ?, last_seen = ? WHERE id = ?', (json.dumps(crops[:8]), now_iso, vis_id))
+                    continue
+                if is_unresolved:
+                    # Throttle re-identification for unregistered / unresolved tracks to once every 1.5 seconds!
+                    # Prevents running 25 heavy neural network inferences per second per face when multiple non-staff or visitors walk by.
+                    if (now_epoch - trk.get('last_attempt_epoch', 0)) < 1.5:
+                        continue
+                    trk['last_attempt_epoch'] = now_epoch
 
             # ── CANDIDATE PATH: NEW UNASSIGNED FACE ENTERING SCENE ──
             is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
@@ -879,6 +889,30 @@ class CameraStreamPipeline:
             by2 = min(H_f, y + h + pad_bot)
             body_crop = frame[by1:by2, bx1:bx2] if by2 > by1 and bx2 > bx1 else face_crop
 
+            # Lazy Crop & Photo base64 encoding (only computed on-demand when saving to DB / broadcast)
+            _cached_face_b64 = [None]
+            _cached_photo_b64 = [None]
+
+            def get_face_b64():
+                if _cached_face_b64[0] is None:
+                    if face_crop is not None and face_crop.size > 0:
+                        ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                        if ok:
+                            _cached_face_b64[0] = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+                    if not _cached_face_b64[0]:
+                        _cached_face_b64[0] = ""
+                return _cached_face_b64[0]
+
+            def get_photo_b64():
+                if _cached_photo_b64[0] is None:
+                    if body_crop is not None and body_crop.size > 0:
+                        ok, buf = cv2.imencode('.jpg', body_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        if ok:
+                            _cached_photo_b64[0] = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+                    if not _cached_photo_b64[0]:
+                        _cached_photo_b64[0] = get_face_b64()
+                return _cached_photo_b64[0]
+
             emb = self.engine._extract_embedding(frame, face)
             instant_gender, gender_conf, age = self.engine._estimate_gender_and_age(frame, face, face_crop, self.camera_id, body_crop)
 
@@ -886,7 +920,6 @@ class CameraStreamPipeline:
             body_b64 = ""
             photo_b64 = ""
 
-            best_track_id = None
             matched_visitor = None
             is_transit = False
             prev_cam_name = None
@@ -942,7 +975,7 @@ class CameraStreamPipeline:
                 if alias and alias in self.engine.unique_cache_by_id:
                     matched_visitor = self.engine.unique_cache_by_id[alias]
 
-            is_exit_camera = (getattr(self, 'role', 'entry') == 'exit') or ('exit' in self.camera_id.lower()) or ('exit' in self.name.lower())
+            is_exit_camera = (getattr(self, 'role', None) == 'exit') if getattr(self, 'role', None) else ('exit' in self.camera_id.lower() or 'exit' in self.name.lower())
 
             # Priority C: Vector Matrix Search (<0.3ms across thousands of faces)
             if matched_visitor is None:
@@ -961,7 +994,7 @@ class CameraStreamPipeline:
                     if vis_embs:
                         all_sims = [cosine_sim(emb, ve) for ve in vis_embs]
                         max_indiv_sim = max(all_sims)
-                        min_crop_sim = 0.52 if is_exit_camera else 0.50
+                        min_crop_sim = 0.45 if matched_visitor.get('is_enrolled') else (0.52 if is_exit_camera else 0.50)
                         if max_indiv_sim < min_crop_sim:
                             matched_visitor = None
                             max_vis_sim = 0.0
@@ -1015,7 +1048,7 @@ class CameraStreamPipeline:
                     # ENTRY / CHECKPOINT CAMERA: Normal New Visitor / Staff Auto-Enrollment
                     # High-confidence gate for creating a BRAND NEW employee profile
                     # Rejects low-confidence noise & floor textures (det_score 0.51)
-                    if det_score < 0.65 or w < 32 or h < 38:
+                    if det_score < 0.65 or w < 32 or h < 38 or not self.engine.is_valid_face_crop(face_crop):
                         continue
 
                     if matched_blacklist is not None and matched_blacklist.get('alias'):
@@ -1035,18 +1068,9 @@ class CameraStreamPipeline:
                     gender = init_gender
                     gender_locked_flag = False
 
-                    if not photo_b64:
-                        if face_crop is not None and face_crop.size > 0:
-                            ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                            if ok:
-                                face_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
-                        if body_crop is not None and body_crop.size > 0:
-                            ok_b, buf_b = cv2.imencode('.jpg', body_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                            if ok_b:
-                                body_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf_b.tobytes()).decode()}"
-                        photo_b64 = body_b64 or face_b64
-
-                    crops_list = [face_b64] if face_b64 else ([photo_b64] if photo_b64 else [])
+                    reg_face_b64 = get_face_b64()
+                    reg_photo_b64 = get_photo_b64()
+                    crops_list = [reg_face_b64] if reg_face_b64 else ([reg_photo_b64] if reg_photo_b64 else [])
 
                     matched_name = matched_blacklist.get('name') if (matched_blacklist and matched_blacklist.get('name') and not matched_blacklist.get('name').startswith('Target')) else None
                     is_enr = 1 if matched_name else 0
@@ -1067,7 +1091,7 @@ class CameraStreamPipeline:
                         'embeddings': [emb],
                         'last_seen': now_iso,
                         'last_seen_epoch': now_epoch,
-                        'photo_b64': photo_b64,
+                        'photo_b64': reg_photo_b64,
                         'crops': crops_list,
                         'best_quality': quality_score,
                         'last_camera': self.camera_id,
@@ -1088,18 +1112,19 @@ class CameraStreamPipeline:
                         self.engine.async_db_execute("""
                             INSERT INTO unique_visitors (id, gender, gender_confidence, age, embedding_json, photo_b64, crops_json, first_seen, last_seen, last_camera, is_blacklisted, blacklist_reason, gender_locked, emp_code, name, department, designation, is_enrolled)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?)
-                        """, (visitor_id, gender, gender_conf, age, json.dumps(emb.tolist()), photo_b64, json.dumps(crops_list), now_iso, now_iso, self.camera_id, 1 if gender_locked_flag else 0, visitor_id, emp_name, emp_dept, matched_visitor.get('designation', 'Staff Member'), is_enr))
+                        """, (visitor_id, gender, gender_conf, age, json.dumps(emb.tolist()), reg_photo_b64, json.dumps(crops_list), now_iso, now_iso, self.camera_id, 1 if gender_locked_flag else 0, visitor_id, emp_name, emp_dept, matched_visitor.get('designation', 'Staff Member'), is_enr))
                         self.engine.async_db_execute("""
                             INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, face_b64, is_blacklisted)
                             VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                        """, (visitor_id, self.camera_id, now_iso, gender, det_score, photo_b64, face_b64))
+                        """, (visitor_id, self.camera_id, now_iso, gender, det_score, reg_photo_b64, reg_face_b64))
                     else:
                         matched_visitor['db_committed'] = False
-                        matched_visitor['pending_db_record'] = (visitor_id, gender, gender_conf, age, json.dumps(emb.tolist()), photo_b64, json.dumps(crops_list), now_iso, now_iso, self.camera_id, 1 if gender_locked_flag else 0)
-                        matched_visitor['pending_sighting_record'] = (visitor_id, self.camera_id, now_iso, gender, det_score, photo_b64, face_b64)
+                        matched_visitor['pending_db_record'] = (visitor_id, gender, gender_conf, age, json.dumps(emb.tolist()), reg_photo_b64, json.dumps(crops_list), now_iso, now_iso, self.camera_id, 1 if gender_locked_flag else 0, visitor_id, emp_name, emp_dept, matched_visitor.get('designation', 'Staff Member'), is_enr)
+                        matched_visitor['pending_sighting_record'] = (visitor_id, self.camera_id, now_iso, gender, det_score, reg_photo_b64, reg_face_b64)
             else:
                 # Existing Visitor Matched
                 visitor_id = matched_visitor['id']
+
                 if not matched_visitor.get('db_committed') and matched_visitor.get('pending_db_record'):
                     matched_visitor['db_committed'] = True
                     p_rec = matched_visitor.pop('pending_db_record', None)
@@ -1107,9 +1132,14 @@ class CameraStreamPipeline:
                     self.engine.sighting_cooldowns[(visitor_id, self.camera_id)] = now_epoch
                     if p_rec:
                         self.engine.async_db_execute("""
-                            INSERT INTO unique_visitors (id, gender, gender_confidence, age, embedding_json, photo_b64, crops_json, first_seen, last_seen, last_camera, is_blacklisted, blacklist_reason, gender_locked)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+                            INSERT INTO unique_visitors (id, gender, gender_confidence, age, embedding_json, photo_b64, crops_json, first_seen, last_seen, last_camera, is_blacklisted, blacklist_reason, gender_locked, emp_code, name, department, designation, is_enrolled)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?)
                         """, p_rec)
+                    if p_sig:
+                        self.engine.async_db_execute("""
+                            INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, face_b64, is_blacklisted)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                        """, p_sig)
                     if p_sig:
                         self.engine.async_db_execute("""
                             INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, face_b64, is_blacklisted)
@@ -1122,9 +1152,13 @@ class CameraStreamPipeline:
                     prev_seen_epoch = matched_visitor.get('last_seen_epoch', 0)
                     transit_elapsed = now_epoch - prev_seen_epoch
 
-                    # Physical walking transit between cameras requires at least 8 seconds.
-                    # If seen on another camera less than 8s ago, it is concurrent/overlapping view
-                    if transit_elapsed < 8.0:
+                    curr_cam_role = str(getattr(self, 'role', '') or CAMERA_SOURCES.get(self.camera_id, {}).get('role', '')).lower()
+                    is_boundary_camera = (curr_cam_role in ('entry', 'exit')) or ('entry' in self.camera_id.lower()) or ('exit' in self.camera_id.lower())
+
+                    # For entry and exit checkpoints (attendance gates), NEVER drop cross-camera events,
+                    # because walking past an exit/entry door within 2-5 seconds of leaving a room is normal and must be logged!
+                    # For internal cameras, only suppress if less than 1.5 seconds to prevent single-frame multi-camera flutter.
+                    if not is_boundary_camera and transit_elapsed < 1.5:
                         matched_visitor['last_seen'] = now_iso
                         matched_visitor['last_seen_epoch'] = now_epoch
                     else:
@@ -1141,7 +1175,7 @@ class CameraStreamPipeline:
                         matched_visitor['last_seen'] = now_iso
                         matched_visitor['last_seen_epoch'] = now_epoch
 
-                        # Broadcast transit event with 180s cooldown
+                        # Broadcast transit event with 60s cooldown
                         transit_event = {
                             'visitor_id': visitor_id,
                             'name': matched_visitor.get('name') or visitor_id,
@@ -1149,11 +1183,11 @@ class CameraStreamPipeline:
                             'from_camera': prev_cam_name,
                             'to_camera': curr_name,
                             'duration_mins': duration_mins,
-                            'photo_b64': matched_visitor.get('photo_b64', photo_b64),
+                            'photo_b64': photo_b64 or matched_visitor.get('photo_b64', ''),
                             'timestamp': get_ist_str("%I:%M:%S %p IST")
                         }
                         last_tr = self.engine.transit_cooldowns.get(visitor_id, 0)
-                        if (now_epoch - last_tr) >= 180.0:
+                        if (now_epoch - last_tr) >= 60.0:
                             self.engine.transit_cooldowns[visitor_id] = now_epoch
                             self.engine._broadcast_transit(transit_event)
 
@@ -1163,24 +1197,90 @@ class CameraStreamPipeline:
                             WHERE id = ?
                         """, (last_cam, prev_cam_name, self.camera_id, now_iso, visitor_id))
 
-                        sighting_key = (visitor_id, self.camera_id)
-                        last_sig = self.engine.sighting_cooldowns.get(sighting_key, 0)
-                        if (now_epoch - last_sig) >= 180.0:
-                            self.engine.sighting_cooldowns[sighting_key] = now_epoch
-                            self.engine.async_db_execute("""
-                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, face_b64, is_blacklisted)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (visitor_id, self.camera_id, now_iso, matched_visitor['gender'], det_score, photo_b64, face_b64, 1 if matched_visitor.get('is_blacklisted') else 0))
+                        # Cross-camera transit: seal previous camera sessions for this visitor
+                        for k in list(self.engine.active_camera_sessions.keys()):
+                            if k[0] == visitor_id:
+                                del self.engine.active_camera_sessions[k]
+
+                        # Insert new sighting waypoint at the new camera
+                        try:
+                            conn_s = sqlite3.connect(DB_PATH, timeout=5.0)
+                            cur_s = conn_s.cursor()
+                            cur_s.execute("""
+                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, last_seen, dwell_mins, gender, confidence, photo_b64, face_b64, is_blacklisted)
+                                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                            """, (visitor_id, self.camera_id, now_iso, now_iso, matched_visitor['gender'], det_score, matched_visitor.get('photo_b64', '') or get_photo_b64(), get_face_b64(), 1 if matched_visitor.get('is_blacklisted') else 0))
+                            new_s_id = cur_s.lastrowid
+                            conn_s.commit()
+                            conn_s.close()
+                        except Exception:
+                            new_s_id = None
+
+                        self.engine.active_camera_sessions[(visitor_id, self.camera_id)] = {
+                            'sighting_id': new_s_id,
+                            'start_epoch': now_epoch,
+                            'start_iso': now_iso,
+                            'last_seen_epoch': now_epoch,
+                            'last_seen_iso': now_iso,
+                            'dwell_mins': 1,
+                            'last_db_update': now_epoch
+                        }
                 else:
                     matched_visitor['last_camera'] = self.camera_id
-                    sighting_key = (visitor_id, self.camera_id)
-                    last_sig = self.engine.sighting_cooldowns.get(sighting_key, 0)
-                    if (now_epoch - last_sig) >= 180.0:
-                        self.engine.sighting_cooldowns[sighting_key] = now_epoch
-                        self.engine.async_db_execute("""
-                            INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, face_b64, is_blacklisted)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (visitor_id, self.camera_id, now_iso, matched_visitor['gender'], det_score, photo_b64, face_b64, 1 if matched_visitor.get('is_blacklisted') else 0))
+                    matched_visitor['last_seen'] = now_iso
+                    matched_visitor['last_seen_epoch'] = now_epoch
+
+                    session_key = (visitor_id, self.camera_id)
+                    session = self.engine.active_camera_sessions.get(session_key)
+
+                    # Option 2: 5-minute (300 seconds) threshold for absence vs continuous presence
+                    is_within_5_mins = (session is not None and (now_epoch - session.get('last_seen_epoch', 0)) <= 300.0)
+
+                    if is_within_5_mins:
+                        # CONTINUOUS PRESENCE AT SAME CAMERA: Update existing waypoint (DO NOT INSERT NEW ROW!)
+                        session['last_seen_epoch'] = now_epoch
+                        session['last_seen_iso'] = now_iso
+                        dwell = max(1, int((now_epoch - session['start_epoch']) / 60))
+                        session['dwell_mins'] = dwell
+
+                        # Debounce DB write to every 10 seconds to keep performance ultra-high
+                        if (now_epoch - session.get('last_db_update', 0)) >= 10.0:
+                            session['last_db_update'] = now_epoch
+                            sig_id = session.get('sighting_id')
+                            if sig_id:
+                                self.engine.async_db_execute("""
+                                    UPDATE visitor_sightings
+                                    SET last_seen = ?, dwell_mins = ?, confidence = MAX(confidence, ?)
+                                    WHERE id = ?
+                                """, (now_iso, dwell, det_score, sig_id))
+                    else:
+                        # RETURN AFTER > 5 MINS ABSENCE: Seal old and start new waypoint
+                        for k in list(self.engine.active_camera_sessions.keys()):
+                            if k[0] == visitor_id:
+                                del self.engine.active_camera_sessions[k]
+
+                        try:
+                            conn_s = sqlite3.connect(DB_PATH, timeout=5.0)
+                            cur_s = conn_s.cursor()
+                            cur_s.execute("""
+                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, last_seen, dwell_mins, gender, confidence, photo_b64, face_b64, is_blacklisted)
+                                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                            """, (visitor_id, self.camera_id, now_iso, now_iso, matched_visitor['gender'], det_score, matched_visitor.get('photo_b64', '') or get_photo_b64(), get_face_b64(), 1 if matched_visitor.get('is_blacklisted') else 0))
+                            new_s_id = cur_s.lastrowid
+                            conn_s.commit()
+                            conn_s.close()
+                        except Exception:
+                            new_s_id = None
+
+                        self.engine.active_camera_sessions[session_key] = {
+                            'sighting_id': new_s_id,
+                            'start_epoch': now_epoch,
+                            'start_iso': now_iso,
+                            'last_seen_epoch': now_epoch,
+                            'last_seen_iso': now_iso,
+                            'dwell_mins': 1,
+                            'last_db_update': now_epoch
+                        }
 
                 self.engine.record_attendance_event(visitor_id, self.camera_id, getattr(self, 'role', 'entry'), now_iso)
 
@@ -1242,10 +1342,11 @@ class CameraStreamPipeline:
                     # If this condition is not met, this frame MUST NOT pollute this profile's crops or embeddings!
                     biometric_pure = (anchor_emb is not None and cosine_sim(emb, anchor_emb) >= 0.65)
 
-                    if biometric_pure and photo_b64 and is_sharp and quality_score >= 32.0 and det_score >= 0.78:
+                    if biometric_pure and is_sharp and quality_score >= 32.0 and det_score >= 0.78:
                         last_crop_epoch = matched_visitor.get('last_crop_epoch', 0)
                         crop_cooldown_ok = (now_epoch - last_crop_epoch) >= 20.0
                         if crop_cooldown_ok and len(crops) < 8:
+                            face_b64 = get_face_b64()
                             if face_b64 and face_b64 not in crops:
                                 crops.append(face_b64)
                                 matched_visitor['crops'] = crops[:8]
@@ -1284,12 +1385,13 @@ class CameraStreamPipeline:
                 now_ep = time.time()
                 hist_key = (target_key, self.camera_id)
                 last_logged = self.engine.blacklist_sighting_history.get(hist_key, 0)
+                bl_photo = (matched_visitor.get('photo_b64') if matched_visitor else None) or get_photo_b64()
                 if (now_ep - last_logged) > 20.0:
                     self.engine.blacklist_sighting_history[hist_key] = now_ep
                     self.engine.async_db_execute("""
                         INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted)
                         VALUES (?, ?, ?, ?, ?, ?, 1)
-                    """, (visitor_id, self.camera_id, now_iso, gender, det_score, photo_b64))
+                    """, (visitor_id, self.camera_id, now_iso, gender, det_score, bl_photo))
 
                 # dismissed_targets ONLY suppresses repeating audio/modal popup notifications
                 is_dismissed = (target_key in self.engine.dismissed_targets) or (threat_name and threat_name.strip().lower() in self.engine.dismissed_targets)
@@ -1304,7 +1406,7 @@ class CameraStreamPipeline:
                             'camera_id': self.camera_id,
                             'camera_name': self.name,
                             'confidence': det_score,
-                            'photo_b64': photo_b64 or (matched_visitor.get('photo_b64') if matched_visitor else None),
+                            'photo_b64': bl_photo,
                             'timestamp': get_ist_str("%I:%M:%S %p IST")
                         }
                         self.engine._broadcast_alert(alert_payload)
@@ -1323,26 +1425,38 @@ class CameraStreamPipeline:
                             now_iso
                         ))
 
-            # Create New Track for newly registered or matched person
-            track_id = self.next_track_id
-            self.next_track_id += 1
-            hist = collections.deque(maxlen=45)
-            hist.append((now_epoch, cx, cy, w, h, (x, y, w, h)))
-            self.active_tracks[track_id] = {
-                'bbox': (x, y, w, h),
-                'history': hist,
-                'bl_consecutive_hits': 1 if is_blacklisted else 0,
-                'last_seen': now,
-                'missed': 0,
-                'visitor_id': visitor_id,
-                'is_blacklisted': is_blacklisted,
-                'threat_name': threat_name,
-                'reason': threat_reason,
-                'is_transit': is_transit,
-                'prev_camera_name': prev_cam_name,
-                'gender': gender,
-                'age': age
-            }
+            if best_track_id is not None and best_track_id in self.active_tracks:
+                track_id = best_track_id
+                trk = self.active_tracks[track_id]
+                trk['visitor_id'] = visitor_id
+                trk['is_blacklisted'] = is_blacklisted
+                trk['threat_name'] = threat_name
+                trk['reason'] = threat_reason
+                trk['is_transit'] = is_transit
+                trk['prev_camera_name'] = prev_cam_name
+                trk['gender'] = gender
+                trk['age'] = age
+            else:
+                # Create New Track for newly registered or matched person
+                track_id = self.next_track_id
+                self.next_track_id += 1
+                hist = collections.deque(maxlen=45)
+                hist.append((now_epoch, cx, cy, w, h, (x, y, w, h)))
+                self.active_tracks[track_id] = {
+                    'bbox': (x, y, w, h),
+                    'history': hist,
+                    'bl_consecutive_hits': 1 if is_blacklisted else 0,
+                    'last_seen': now,
+                    'missed': 0,
+                    'visitor_id': visitor_id,
+                    'is_blacklisted': is_blacklisted,
+                    'threat_name': threat_name,
+                    'reason': threat_reason,
+                    'is_transit': is_transit,
+                    'prev_camera_name': prev_cam_name,
+                    'gender': gender,
+                    'age': age
+                }
             matched_track_ids.add(track_id)
 
         # Age out stale tracks: allow up to 2.5 seconds (or 25 missed frames) for stable walking continuity
@@ -1383,7 +1497,7 @@ class CameraStreamPipeline:
             reg_name = v_profile.get('name')
             is_enrolled_person = bool(v_profile.get('is_enrolled') or (reg_name and not reg_name.startswith('EMP-') and not reg_name.startswith('Target')))
             emp_display_title = reg_name if is_enrolled_person else t_vid
-            is_camera_exit = (getattr(self, 'role', 'entry') == 'exit') or ('exit' in self.camera_id.lower()) or ('exit' in self.name.lower())
+            is_camera_exit = (getattr(self, 'role', None) == 'exit') if getattr(self, 'role', None) else ('exit' in self.camera_id.lower() or 'exit' in self.name.lower())
 
             if t_blacklisted:
                 color = (30, 30, 235)  # Crimson Red
@@ -1480,7 +1594,7 @@ class FaceTrackerEngine:
         arcface_path = str(MODELS / 'w600k_mbf.onnx')
         gender_path = str(MODELS / 'genderage.onnx')
 
-        self.detector = cv2.FaceDetectorYN_create(det_path, '', (960, 540), 0.45, 0.3, 1000)
+        self.detector = cv2.FaceDetectorYN_create(det_path, '', (720, 405), 0.45, 0.3, 1000)
         self.recognizer = cv2.FaceRecognizerSF_create(rec_path, '')
         
         self.arcface_sess = None
@@ -1537,6 +1651,7 @@ class FaceTrackerEngine:
         self.attendance_cooldowns = {}
         self.sighting_cooldowns = {}
         self.transit_cooldowns = {}
+        self.active_camera_sessions = {}
         self.recent_auto_enrolled = collections.deque(maxlen=30)
 
         # Vectorized acceleration matrices
@@ -1552,8 +1667,8 @@ class FaceTrackerEngine:
         self.db_thread.start()
 
         self._load_caches_from_db()
-        self._seed_staff_and_30d_attendance()
-        self._load_caches_from_db()
+        # Disabled automatic dummy staff & attendance seeding
+        # self._seed_staff_and_30d_attendance()
 
         # Initialize multi-camera concurrent stream pipelines
         self.pipelines = {}
@@ -1684,18 +1799,8 @@ class FaceTrackerEngine:
 
     def _detect_faces(self, frame: np.ndarray, detector=None):
         h, w = frame.shape[:2]
-        target_w, target_h = 960, 540
+        target_w, target_h = 720, 405
         small = cv2.resize(frame, (target_w, target_h))
-
-        # Backlight & shadow illumination for doorway corridors (enhances shadowed faces against sunlit doors)
-        try:
-            lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)
-            l_ch, a_ch, b_ch = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-            cl = clahe.apply(l_ch)
-            det_img = cv2.cvtColor(cv2.merge((cl, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
-        except Exception:
-            det_img = small
 
         det = detector or self.detector
         if det is None:
@@ -1703,11 +1808,11 @@ class FaceTrackerEngine:
 
         if detector is not None:
             det.setInputSize((target_w, target_h))
-            _, faces = det.detect(det_img)
+            _, faces = det.detect(small)
         else:
             with self.inference_lock:
                 det.setInputSize((target_w, target_h))
-                _, faces = det.detect(det_img)
+                _, faces = det.detect(small)
         if faces is None:
             return []
         faces = faces.copy()
@@ -1798,54 +1903,56 @@ class FaceTrackerEngine:
 
             # In image coords, subject right eye is on the left (re_x < le_x)
             eye_dx = le_x - re_x
-            if eye_dx <= 8.0:
+            if eye_dx <= 4.0:
                 # Inverted, horizontal ear, or collapsed points
                 return False, 0.0
 
             eye_dy = abs(le_y - re_y)
-            # Head tilt / roll check (max ~35 degrees)
-            if eye_dy > eye_dx * 0.70:
+            # Head tilt / roll check (max ~45 degrees)
+            if eye_dy > eye_dx * 0.85:
                 return False, 0.0
 
             eye_dist = math.hypot(eye_dx, eye_dy)
-            # Eye separation vs face width: normal human face has eye_dist between 28% and 65% of box width
+            # Eye separation vs face width: accommodates overhead camera angle & glasses
             eye_ratio = eye_dist / max(float(w), 1.0)
-            if eye_ratio < 0.28 or eye_ratio > 0.65:
+            if eye_ratio < 0.16 or eye_ratio > 0.72:
                 return False, 0.0
 
-            # Frontality gate: nose tip must sit horizontally between the two eyes
-            min_eye_x = min(re_x, le_x)
-            max_eye_x = max(re_x, le_x)
-            eye_span = max_eye_x - min_eye_x
-            if nt_x < (min_eye_x + 0.10 * eye_span) or nt_x > (max_eye_x - 0.10 * eye_span):
-                # Nose is outside eye span (extreme side profile > 40 deg or back of head/neck)
+            # Mouth width / landmark validation: mouth corners must have horizontal separation
+            mouth_dx = lcm_x - rcm_x
+            if mouth_dx <= 2.0:
+                # Collapsed mouth points, ear contours, back of head
                 return False, 0.0
 
-            # Yaw symmetry check: distance from nose to left eye vs right eye
+            mouth_dy = abs(lcm_y - rcm_y)
+            if mouth_dy > max(mouth_dx * 0.85, 8.0):
+                # Extreme vertical distortion / false landmark
+                return False, 0.0
+
+            # Yaw symmetry check (ensures face is facing camera, rejects profile ears and back of head)
             d_re_nose = math.hypot(nt_x - re_x, nt_y - re_y)
             d_le_nose = math.hypot(nt_x - le_x, nt_y - le_y)
             yaw_sym = min(d_re_nose, d_le_nose) / max(d_re_nose, d_le_nose, 1e-4)
-            if yaw_sym < 0.36:
-                # Extreme side angle / ear view / back of head
+            if yaw_sym < 0.28:
                 return False, 0.0
 
-            # Vertical facial topology:
+            # Vertical facial topology (accommodates downward CCTV overhead perspective):
             # 1. Nose MUST be below the eye line
             eye_avg_y = (re_y + le_y) / 2.0
             eye_to_nose_dy = nt_y - eye_avg_y
-            if eye_to_nose_dy < (0.16 * eye_dist):
+            if eye_to_nose_dy < (0.08 * eye_dist):
                 return False, 0.0
 
             # 2. Mouth MUST be below the nose
             mouth_y = (rcm_y + lcm_y) / 2.0
             nose_to_mouth_dy = mouth_y - nt_y
-            if nose_to_mouth_dy < (0.16 * eye_dist):
+            if nose_to_mouth_dy < (0.08 * eye_dist):
                 return False, 0.0
 
             # 3. Total vertical face height (eye line to mouth)
             total_face_h = mouth_y - eye_avg_y
             h_ratio = total_face_h / max(float(h), 1.0)
-            if h_ratio < 0.30 or h_ratio > 0.82:
+            if h_ratio < 0.26 or h_ratio > 0.86:
                 return False, 0.0
 
         try:
@@ -2329,15 +2436,19 @@ class FaceTrackerEngine:
             # -----------------------------------------------------------------
             best_enrolled_vis = None
             best_enrolled_sim = 0.0
-            enr_threshold = 0.52 if getattr(self, 'arcface_sess', None) is not None else 0.48
+            enr_threshold = 0.45
             for idx in top_k_indices:
                 sim = float(sims[idx])
                 vis = self.gallery_index[idx]
                 if not vis.get('is_enrolled'):
                     continue
                 cand_gender = vis.get('gender')
+                # For verified enrolled staff with multi-angle biometric vectors, do NOT drop
+                # biometric matches (>= 0.45) just because single-frame instant gender estimation jittered.
+                # Only check gender if query_gender has extreme confidence (>0.92) and similarity is borderline (<0.48).
                 if query_gender and cand_gender and vis.get('gender_locked') and cand_gender != query_gender:
-                    continue
+                    if sim < 0.48 and gender_conf > 0.92:
+                        continue
                 if sim >= enr_threshold and sim > best_enrolled_sim:
                     best_enrolled_vis = vis
                     best_enrolled_sim = sim
@@ -2471,121 +2582,300 @@ class FaceTrackerEngine:
         cam_info = CAMERA_SOURCES.get(camera_id, {})
         cam_name = cam_info.get('name', camera_id)
         crole = str(camera_role or cam_info.get('role', 'entry')).lower()
-        is_exit = (crole == 'exit') or ('exit' in camera_id.lower()) or ('exit' in cam_name.lower()) or ('checkout' in camera_id.lower())
 
+        # Always update last sighting detection in memory
         v = self.unique_cache_by_id.get(employee_id)
         if v:
             v['last_seen'] = timestamp_iso
             v['last_camera'] = camera_id
+            v['last_camera_name'] = cam_name
+            v['total_sightings'] = v.get('total_sightings', 0) + 1
 
-        # MINIMUM DWELL & CHECK-IN GUARD: Prevent rapid spurious triggers
-        if is_exit:
-            if not v:
+        # Always update last seen in unique_visitors database
+        try:
+            self.async_db_execute("""
+                UPDATE unique_visitors 
+                SET last_seen = ?, last_camera = ?, total_sightings = total_sightings + 1
+                WHERE id = ?
+            """, (timestamp_iso, camera_id, employee_id))
+        except Exception:
+            pass
+
+        # -------------------------------------------------------------
+        # ROLE 1: INWARDS / PERIMETER (Transit & Sighting Tracking)
+        # Does NOT alter check-in or check-out times or today_status.
+        # Updates latest spotted snapshot in Journey log and cameras visited.
+        # -------------------------------------------------------------
+        if crole in ('internal', 'perimeter', 'transit', 'ward'):
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=5.0)
+                cur = conn.cursor()
+                cur.execute("SELECT id, cameras_visited, sightings_count FROM daily_attendance WHERE employee_id = ? AND date = ?", (employee_id, date_str))
+                row = cur.fetchone()
+                if row:
+                    rec_id, cams_v, scnt = row
+                    cams_set = set((cams_v or '').split(','))
+                    cams_set.add(camera_id)
+                    new_cams_v = ','.join(c for c in cams_set if c)
+                    cur.execute("UPDATE daily_attendance SET cameras_visited = ?, sightings_count = sightings_count + 1 WHERE id = ?", (new_cams_v, rec_id))
+                else:
+                    cur.execute("""
+                        INSERT INTO daily_attendance (
+                            employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
+                            check_out_time, check_out_camera, check_out_camera_name,
+                            duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
+                        ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 'in_hospital', 0, 1, ?)
+                    """, (employee_id, date_str, camera_id))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+            return
+
+        # -------------------------------------------------------------
+        # ROLE 2: INBOUND ENTRY (Daily Check-In & Entry Attendance)
+        # Updates check-in time (first entry passage of the day only).
+        # When returning from checkout (e.g. lunch), reactivates 'in_hospital' (On Duty).
+        # Does NOT overwrite existing check-in time or clear the last check-out time.
+        # -------------------------------------------------------------
+        if crole == 'entry':
+            is_reentry = False
+            if v:
+                # Check-in time is ONLY set from the FIRST entry passage of the day
+                if not v.get('today_check_in'):
+                    v['today_check_in'] = timestamp_iso
+                    v['today_check_in_camera'] = camera_id
+                    v['today_check_in_camera_name'] = cam_name
+                if v.get('today_status') == 'checked_out':
+                    is_reentry = True
+                v['today_status'] = 'in_hospital'
+                v['is_checkout_verified'] = False
+                v['last_in_time'] = timestamp_iso
+
+            # Debounce: avoid consecutive DB writes within 60s unless returning from checkout
+            cooldown_key = (employee_id, 'entry')
+            last_rec = self.attendance_cooldowns.get(cooldown_key, 0)
+            if not is_reentry and (now_ep - last_rec) < 60.0:
                 return
-            if v.get('today_status') == 'checked_out':
-                return  # Already checked out today! Locked.
-            ref_in_time = v.get('last_in_time') or v.get('today_check_in')
-            if ref_in_time:
-                try:
-                    dt_in = datetime.fromisoformat(ref_in_time)
-                    dt_now = datetime.fromisoformat(timestamp_iso)
-                    dwell_seconds = (dt_now - dt_in).total_seconds()
-                    if dwell_seconds < 3.0:
-                        return
-                except Exception:
-                    pass
+            self.attendance_cooldowns[cooldown_key] = now_ep
 
-        # COOLDOWN CHECK: Avoid re-writing DB on every single frame!
-        cooldown_key = (employee_id, 'exit' if is_exit else 'entry')
-        last_rec = self.attendance_cooldowns.get(cooldown_key, 0)
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                cur = conn.cursor()
+                cur.execute("SELECT id, check_in_time, check_out_time, sightings_count, cameras_visited FROM daily_attendance WHERE employee_id = ? AND date = ?", (employee_id, date_str))
+                row = cur.fetchone()
+                if not row:
+                    cur.execute("""
+                        INSERT INTO daily_attendance (
+                            employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
+                            check_out_time, check_out_camera, check_out_camera_name,
+                            duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
+                        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0, 'in_hospital', 0, 1, ?)
+                    """, (employee_id, date_str, timestamp_iso, camera_id, cam_name, camera_id))
+                else:
+                    rec_id, ex_in, ex_out, scnt, cams_v = row
+                    cams_set = set((cams_v or '').split(','))
+                    cams_set.add(camera_id)
+                    new_cams_v = ','.join(c for c in cams_set if c)
+                    # If check_in_time was not set yet (e.g. seen on internal/exit first), set it now!
+                    # If ex_in already exists, keep ex_in (never overwrite first check-in of the day)
+                    if not ex_in:
+                        cur.execute("""
+                            UPDATE daily_attendance SET
+                                check_in_time = ?,
+                                check_in_camera = ?,
+                                check_in_camera_name = ?,
+                                status = 'in_hospital',
+                                is_checkout_verified = 0,
+                                sightings_count = sightings_count + 1,
+                                cameras_visited = ?
+                            WHERE id = ?
+                        """, (timestamp_iso, camera_id, cam_name, new_cams_v, rec_id))
+                    else:
+                        cur.execute("""
+                            UPDATE daily_attendance SET
+                                status = 'in_hospital',
+                                is_checkout_verified = 0,
+                                sightings_count = sightings_count + 1,
+                                cameras_visited = ?
+                            WHERE id = ?
+                        """, (new_cams_v, rec_id))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print("[ATTENDANCE ENTRY ERROR]:", e)
+            return
 
-        if not is_exit:
-            # If already marked in_hospital today and logged within 300s, do not commit redundant DB update
-            if v and v.get('today_status') == 'in_hospital' and (now_ep - last_rec) < 300.0:
-                return
-        else:
-            # If already marked checked_out today, lock check-out permanently for shift
-            if v and v.get('today_status') == 'checked_out':
-                return
-
-        self.attendance_cooldowns[cooldown_key] = now_ep
-
-        # Update in-memory profile
-        if v:
-            if is_exit:
+        # -------------------------------------------------------------
+        # ROLE 3: EXIT / CHECK-OUT (Departure & Duty Attendance)
+        # Updates check-out time (always records the LAST exit camera record).
+        # Does NOT set check-in time (check-in comes only from entry camera).
+        # -------------------------------------------------------------
+        if crole == 'exit':
+            if v:
                 v['today_status'] = 'checked_out'
                 v['today_check_out'] = timestamp_iso
                 v['today_check_out_camera'] = camera_id
                 v['today_check_out_camera_name'] = cam_name
                 v['is_checkout_verified'] = True
-            else:
-                if not v.get('today_check_in'):
-                    v['today_check_in'] = timestamp_iso
-                    v['today_check_in_camera'] = camera_id
-                    v['today_check_in_camera_name'] = cam_name
-                v['last_in_time'] = timestamp_iso
-                v['today_status'] = 'in_hospital'
-                v['is_checkout_verified'] = False
+                v['exit_time_iso'] = timestamp_iso
 
-        # Execute DB update
+            # Debounce: avoid duplicate DB writes within 10s on consecutive frames
+            cooldown_key = (employee_id, 'exit')
+            last_rec = self.attendance_cooldowns.get(cooldown_key, 0)
+            if (now_ep - last_rec) < 10.0:
+                return
+            self.attendance_cooldowns[cooldown_key] = now_ep
+
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                cur = conn.cursor()
+                cur.execute("SELECT id, check_in_time, check_out_time, sightings_count, cameras_visited, duration_minutes FROM daily_attendance WHERE employee_id = ? AND date = ?", (employee_id, date_str))
+                row = cur.fetchone()
+                if not row:
+                    # Seen at exit camera first before any entry record: check_in_time is NULL!
+                    cur.execute("""
+                        INSERT INTO daily_attendance (
+                            employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
+                            check_out_time, check_out_camera, check_out_camera_name,
+                            duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
+                        ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, 0, 'checked_out', 1, 1, ?)
+                    """, (employee_id, date_str, timestamp_iso, camera_id, cam_name, camera_id))
+                else:
+                    rec_id, ex_in, ex_out, scnt, cams_v, prev_dur = row
+                    cams_set = set((cams_v or '').split(','))
+                    cams_set.add(camera_id)
+                    new_cams_v = ','.join(c for c in cams_set if c)
+                    # Calculate cumulative duty minutes across all shifts today
+                    calc_duty = self.get_today_duty_minutes(employee_id, date_str)
+                    if calc_duty > 0:
+                        dur = calc_duty
+                    elif ex_in:
+                        try:
+                            dt_in = datetime.fromisoformat(ex_in)
+                            dt_out = datetime.fromisoformat(timestamp_iso)
+                            dur = max(1, int((dt_out - dt_in).total_seconds() / 60))
+                        except Exception:
+                            dur = prev_dur or 0
+                    else:
+                        dur = prev_dur or 0
+                    cur.execute("""
+                        UPDATE daily_attendance SET
+                            check_out_time = ?,
+                            check_out_camera = ?,
+                            check_out_camera_name = ?,
+                            duration_minutes = ?,
+                            status = 'checked_out',
+                            is_checkout_verified = 1,
+                            sightings_count = sightings_count + 1,
+                            cameras_visited = ?
+                        WHERE id = ?
+                    """, (timestamp_iso, camera_id, cam_name, dur, new_cams_v, rec_id))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print("[ATTENDANCE EXIT ERROR]:", e)
+            return
+
+    def get_today_duty_minutes(self, employee_id: str, date_str: str = None) -> int:
+        if not employee_id:
+            return 0
+        if not date_str:
+            date_str = get_ist_now().strftime('%Y-%m-%d')
+
         try:
             conn = sqlite3.connect(DB_PATH, timeout=10.0)
             cur = conn.cursor()
-            cur.execute("SELECT id, check_in_time, check_out_time, sightings_count, cameras_visited FROM daily_attendance WHERE employee_id = ? AND date = ?", (employee_id, date_str))
-            row = cur.fetchone()
-            if not row:
-                in_time = timestamp_iso
-                out_time = timestamp_iso if is_exit else None
-                status = 'checked_out' if is_exit else 'in_hospital'
-                is_ver = 1 if is_exit else 0
-                dur = 480 if is_exit else 0
-                cur.execute("""
-                    INSERT INTO daily_attendance (
-                        employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
-                        check_out_time, check_out_camera, check_out_camera_name,
-                        duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                """, (employee_id, date_str, in_time, 'main' if is_exit else camera_id, 'Main Porch Entry' if is_exit else cam_name,
-                      out_time, camera_id if is_exit else None, cam_name if is_exit else None,
-                      dur, status, is_ver, camera_id))
-            else:
-                rec_id, ex_in, ex_out, scnt, cams_v = row
-                cams_set = set((cams_v or '').split(','))
-                cams_set.add(camera_id)
-                new_cams_v = ','.join(c for c in cams_set if c)
-                new_scnt = (scnt or 1) + 1
-                if is_exit:
-                    new_out = timestamp_iso
-                    try:
-                        dt_in = datetime.fromisoformat(ex_in)
-                        dt_out = datetime.fromisoformat(new_out)
-                        dur = max(1, int((dt_out - dt_in).total_seconds() / 60))
-                    except Exception:
-                        dur = 480
-                    cur.execute("""
-                        UPDATE daily_attendance SET
-                            check_out_time = ?, check_out_camera = ?, check_out_camera_name = ?,
-                            duration_minutes = ?, status = 'checked_out', is_checkout_verified = 1,
-                            sightings_count = ?, cameras_visited = ?
-                        WHERE id = ?
-                    """, (new_out, camera_id, cam_name, dur, new_scnt, new_cams_v, rec_id))
-                else:
-                    try:
-                        dt_in = datetime.fromisoformat(ex_in)
-                        dt_now = datetime.fromisoformat(timestamp_iso)
-                        dur = max(1, int((dt_now - dt_in).total_seconds() / 60))
-                    except Exception:
-                        dur = 60
-                    cur.execute("""
-                        UPDATE daily_attendance SET
-                            duration_minutes = ?, status = 'in_hospital', is_checkout_verified = 0,
-                            sightings_count = ?, cameras_visited = ?
-                        WHERE id = ?
-                    """, (dur, new_scnt, new_cams_v, rec_id))
-            conn.commit()
+            cur.execute("""
+                SELECT camera_id, timestamp
+                FROM visitor_sightings
+                WHERE visitor_id = ? AND timestamp LIKE ?
+                ORDER BY timestamp ASC
+            """, (employee_id, f"{date_str}%"))
+            rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT check_in_time, check_out_time, status, is_checkout_verified, duration_minutes
+                FROM daily_attendance
+                WHERE employee_id = ? AND date = ?
+            """, (employee_id, date_str))
+            att_row = cur.fetchone()
             conn.close()
-        except Exception as e:
-            print("[ATTENDANCE RECORD ERROR]:", e)
+        except Exception:
+            return 0
+
+        if not rows and not att_row:
+            return 0
+
+        entry_cams = set(cid for cid, c in CAMERA_SOURCES.items() if c.get('role') == 'entry')
+        entry_cams.update(['staff', 'main'])
+        exit_cams = set(cid for cid, c in CAMERA_SOURCES.items() if c.get('role') == 'exit')
+        exit_cams.update(['staff_exit', 'cam_cd9e9a'])
+
+        total_seconds = 0
+        active_in_dt = None
+
+        for cam_id, ts in rows:
+            cam_id_lower = str(cam_id or '').lower()
+            cam_info = CAMERA_SOURCES.get(cam_id, {})
+            cam_role = str(cam_info.get('role', '')).lower()
+            is_entry = (cam_role == 'entry') or (cam_id in entry_cams) or ('entry' in cam_id_lower)
+            is_exit = (cam_role == 'exit') or (cam_id in exit_cams) or ('exit' in cam_id_lower)
+
+            try:
+                dt = datetime.fromisoformat(ts).replace(tzinfo=None)
+            except Exception:
+                continue
+
+            if is_entry:
+                if active_in_dt is None:
+                    active_in_dt = dt
+            elif is_exit:
+                if active_in_dt is not None:
+                    session_sec = max(0, (dt - active_in_dt).total_seconds())
+                    total_seconds += session_sec
+                    active_in_dt = None
+
+        # Check if employee is currently ON DUTY (accumulating live minutes)
+        v_mem = self.unique_cache_by_id.get(employee_id, {})
+        mem_status = v_mem.get('today_status')
+        db_status = att_row[2] if att_row else None
+        is_on_duty = (mem_status == 'in_hospital') or (mem_status != 'checked_out' and db_status == 'in_hospital')
+
+        # If on duty but active_in_dt is not set, find active in timestamp
+        if is_on_duty and active_in_dt is None:
+            in_candidate = v_mem.get('last_in_time') or (att_row[0] if att_row else None)
+            if in_candidate:
+                try:
+                    active_in_dt = datetime.fromisoformat(in_candidate).replace(tzinfo=None)
+                except Exception:
+                    pass
+            elif rows:
+                try:
+                    active_in_dt = datetime.fromisoformat(rows[-1][1]).replace(tzinfo=None)
+                except Exception:
+                    pass
+
+        if is_on_duty and active_in_dt is not None:
+            now_dt = get_ist_now().replace(tzinfo=None)
+            ongoing_sec = max(0, (now_dt - active_in_dt).total_seconds())
+            total_seconds += ongoing_sec
+        elif not is_on_duty and active_in_dt is not None:
+            # If checked out, but an exit sighting was missing from visitor_sightings:
+            # close using check_out_time from daily_attendance
+            if att_row and att_row[1]:
+                try:
+                    out_dt = datetime.fromisoformat(att_row[1]).replace(tzinfo=None)
+                    session_sec = max(0, (out_dt - active_in_dt).total_seconds())
+                    total_seconds += session_sec
+                except Exception:
+                    pass
+
+        calc_mins = int(total_seconds / 60)
+        if calc_mins <= 0 and att_row and att_row[4] and att_row[4] > 0:
+            return att_row[4]
+
+        return max(0, calc_mins)
 
     def get_employee_30d_stats(self, employee_id: str):
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
@@ -2602,11 +2892,15 @@ class FaceTrackerEngine:
         rows = cur.fetchall()
 
         # Query in/out sighting counts per day from visitor_sightings
-        cur.execute("""
+        entry_cams = [cid for cid, c in CAMERA_SOURCES.items() if c.get('role') == 'entry'] + ['staff', 'main']
+        exit_cams = [cid for cid, c in CAMERA_SOURCES.items() if c.get('role') == 'exit'] + ['staff_exit', 'cam_cd9e9a']
+        entry_sql = "'" + "','".join(set(entry_cams)) + "'"
+        exit_sql = "'" + "','".join(set(exit_cams)) + "'"
+        cur.execute(f"""
             SELECT 
                 date(timestamp) as s_date,
-                SUM(CASE WHEN camera_id IN ('staff', 'main') OR camera_id LIKE '%entry%' THEN 1 ELSE 0 END) as in_cnt,
-                SUM(CASE WHEN camera_id IN ('staff_exit', 'cam_cd9e9a') OR camera_id LIKE '%exit%' THEN 1 ELSE 0 END) as out_cnt,
+                SUM(CASE WHEN camera_id IN ({entry_sql}) OR camera_id LIKE '%entry%' THEN 1 ELSE 0 END) as in_cnt,
+                SUM(CASE WHEN camera_id IN ({exit_sql}) OR camera_id LIKE '%exit%' THEN 1 ELSE 0 END) as out_cnt,
                 COUNT(*) as total_sightings
             FROM visitor_sightings
             WHERE visitor_id = ?
@@ -2631,25 +2925,26 @@ class FaceTrackerEngine:
             st = r[8] or 'in_hospital'
             is_chk = bool(r[9])
 
-            in_disp = in_t.split('T')[1][:5] if (in_t and 'T' in in_t) else '08:30'
-            try:
-                dt_obj = datetime.fromisoformat(in_t)
-                in_disp = dt_obj.strftime("%I:%M %p")
-            except Exception:
-                pass
+            in_disp = None
+            if in_t:
+                try:
+                    dt_obj = datetime.fromisoformat(in_t)
+                    in_disp = dt_obj.strftime("%I:%M %p")
+                except Exception:
+                    in_disp = in_t.split('T')[1][:5] if 'T' in in_t else in_t
 
+            out_disp = None
             if out_t:
-                out_disp = out_t.split('T')[1][:5] if 'T' in out_t else '17:30'
                 try:
                     dt_out = datetime.fromisoformat(out_t)
                     out_disp = dt_out.strftime("%I:%M %p")
                 except Exception:
-                    pass
-            else:
-                out_disp = "In Hospital"
+                    out_disp = out_t.split('T')[1][:5] if 'T' in out_t else out_t
 
+            if d_str == get_ist_now().strftime('%Y-%m-%d'):
+                dur_m = self.get_today_duty_minutes(employee_id, d_str)
             dh, dm = divmod(dur_m, 60)
-            dur_str = f"{dh}h {dm:02d}m" if dur_m > 0 else "< 15m"
+            dur_str = f"{dh}h {dm:02d}m"
 
             try:
                 f_date = datetime.strptime(d_str, "%Y-%m-%d").strftime("%a, %d %b %Y")
@@ -2708,264 +3003,8 @@ class FaceTrackerEngine:
         }
 
     def _seed_staff_and_30d_attendance(self):
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-            cur = conn.cursor()
-            today_date = get_ist_date_str()
-            cur.execute("SELECT count(*) FROM daily_attendance WHERE date = ?", (today_date,))
-            today_cnt = cur.fetchone()[0]
-            cur.execute("SELECT count(*) FROM daily_attendance")
-            cnt = cur.fetchone()[0]
-            if cnt >= 15 and today_cnt > 0:
-                conn.close()
-                return  # Database already seeded or active
-            only_today = (cnt >= 15 and today_cnt == 0)
-
-            print("[ATTENDANCE SEEDER] Generating realistic 30-day Medanta staff attendance records...")
-            import random
-            now = get_ist_now()
-
-            staff_list = [
-                {
-                    'id': 'EMP-01',
-                    'emp_code': 'EMP-01',
-                    'name': 'Dr. Naresh Trehan',
-                    'department': 'Cardiology & Cardiac Surgery',
-                    'designation': 'Chairman & Chief Cardiac Surgeon',
-                    'is_enrolled': 1,
-                    'gender': 'male',
-                    'age': 56,
-                    'shift_start': (8, 30),
-                    'shift_duration_hours': 9.25,
-                    'work_days': 26,
-                    'today_status': 'in_hospital'
-                },
-                {
-                    'id': 'EMP-02',
-                    'emp_code': 'EMP-02',
-                    'name': 'Dr. Arvinder Singh Soin',
-                    'department': 'Liver Transplantation & Hepatobiliary',
-                    'designation': 'Chief Hepatobiliary Surgeon',
-                    'is_enrolled': 1,
-                    'gender': 'male',
-                    'age': 52,
-                    'shift_start': (8, 45),
-                    'shift_duration_hours': 8.75,
-                    'work_days': 25,
-                    'today_status': 'checked_out'
-                },
-                {
-                    'id': 'EMP-03',
-                    'emp_code': 'EMP-03',
-                    'name': 'Dr. Yatin Mehta',
-                    'department': 'Critical Care & Anaesthesiology',
-                    'designation': 'Chairman, Critical Care',
-                    'is_enrolled': 1,
-                    'gender': 'male',
-                    'age': 54,
-                    'shift_start': (8, 15),
-                    'shift_duration_hours': 8.5,
-                    'work_days': 24,
-                    'today_status': 'in_hospital'
-                },
-                {
-                    'id': 'EMP-04',
-                    'emp_code': 'EMP-04',
-                    'name': 'Sister Sunita Sharma',
-                    'department': 'Nursing Operations',
-                    'designation': 'Senior Nursing Supervisor',
-                    'is_enrolled': 1,
-                    'gender': 'female',
-                    'age': 38,
-                    'shift_start': (7, 45),
-                    'shift_duration_hours': 8.25,
-                    'work_days': 27,
-                    'today_status': 'checked_out'
-                },
-                {
-                    'id': 'EMP-05',
-                    'emp_code': 'EMP-05',
-                    'name': 'Ramesh Kumar',
-                    'department': 'Security & Surveillance',
-                    'designation': 'Security Supervisor',
-                    'is_enrolled': 1,
-                    'gender': 'male',
-                    'age': 42,
-                    'shift_start': (7, 30),
-                    'shift_duration_hours': 8.5,
-                    'work_days': 28,
-                    'today_status': 'in_hospital'
-                },
-                {
-                    'id': 'EMP-06',
-                    'emp_code': 'EMP-06',
-                    'name': None,
-                    'department': 'General Staff',
-                    'designation': 'Staff Member',
-                    'is_enrolled': 0,
-                    'gender': 'female',
-                    'age': 29,
-                    'shift_start': (9, 0),
-                    'shift_duration_hours': 7.75,
-                    'work_days': 22,
-                    'today_status': 'in_hospital'
-                },
-                {
-                    'id': 'EMP-07',
-                    'emp_code': 'EMP-07',
-                    'name': None,
-                    'department': 'General Staff',
-                    'designation': 'Staff Member',
-                    'is_enrolled': 0,
-                    'gender': 'male',
-                    'age': 34,
-                    'shift_start': (9, 15),
-                    'shift_duration_hours': 8.0,
-                    'work_days': 21,
-                    'today_status': 'checked_out'
-                },
-                {
-                    'id': 'EMP-08',
-                    'emp_code': 'EMP-08',
-                    'name': None,
-                    'department': 'General Staff',
-                    'designation': 'Staff Member',
-                    'is_enrolled': 0,
-                    'gender': 'female',
-                    'age': 31,
-                    'shift_start': (8, 50),
-                    'shift_duration_hours': 8.2,
-                    'work_days': 23,
-                    'today_status': 'in_hospital'
-                }
-            ]
-
-            for s in staff_list:
-                # Synthetic unit-normalized embedding for each staff member
-                rng = np.random.RandomState(abs(hash(s['id'])) % (2**31))
-                dim = 512 if getattr(self, 'arcface_sess', None) is not None else 128
-                syn_emb = rng.randn(dim).astype(np.float32)
-                syn_emb = syn_emb / np.linalg.norm(syn_emb)
-                emb_json = json.dumps(syn_emb.tolist())
-
-                # Generate clean avatar
-                img_av = np.zeros((128, 128, 3), dtype=np.uint8)
-                dept_s = s.get('department', '')
-                if 'Cardio' in dept_s:
-                    bg_av = (180, 50, 40)
-                elif 'Liver' in dept_s:
-                    bg_av = (40, 140, 190)
-                elif 'Critical' in dept_s:
-                    bg_av = (160, 90, 30)
-                elif 'Nursing' in dept_s:
-                    bg_av = (140, 70, 150)
-                elif 'Security' in dept_s:
-                    bg_av = (40, 90, 40)
-                else:
-                    bg_av = (70, 100, 120)
-                img_av[:] = bg_av
-                clean_n = s.get('name') or s['id']
-                for pfx in ["Dr. ", "Sister "]:
-                    if clean_n.startswith(pfx):
-                        clean_n = clean_n[len(pfx):]
-                parts = clean_n.strip().split()
-                ini = (parts[0][0] + (parts[1][0] if len(parts) > 1 else ""))[:2].upper()
-                cv2.putText(img_av, ini, (26, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
-                _, buf_av = cv2.imencode('.jpg', img_av, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                avatar_b64 = base64.b64encode(buf_av).decode('utf-8')
-                crops_json = json.dumps([avatar_b64])
-
-                cur.execute("""
-                    INSERT OR REPLACE INTO unique_visitors (
-                        id, emp_code, name, department, designation, is_enrolled, gender, gender_confidence, age,
-                        embedding_json, photo_b64, crops_json, first_seen, last_seen, total_sightings, last_camera,
-                        is_blacklisted, blacklist_reason, gender_locked, enrollment_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0.95, ?, ?, ?, ?, ?, ?, 45, 'main', 0, NULL, 1, ?)
-                """, (
-                    s['id'], s['emp_code'], s['name'], s['department'], s['designation'], s['is_enrolled'],
-                    s['gender'], s['age'], emb_json, avatar_b64, crops_json,
-                    (now - timedelta(days=29)).isoformat(), now.isoformat(),
-                    now.strftime('%Y-%m-%d') if s['is_enrolled'] else None
-                ))
-
-                if s['is_enrolled'] and s['name']:
-                    cur.execute("""
-                        INSERT OR REPLACE INTO blacklist_watchlist (
-                            id, name, alias, category, reason, embedding_json, photo_b64, crops_json, enrolled_at, enrolled_by, active
-                        ) VALUES (?, ?, ?, ?, 'Registered Hospital Staff Member', ?, ?, ?, ?, 'HR Admin', 1)
-                    """, (f"STAFF-{s['id']}", s['name'], s['id'], s['department'], emb_json, avatar_b64, crops_json, now.isoformat()))
-
-                all_days = list(range(30))
-                work_sample = [0] if only_today else ([0] + random.sample(all_days[1:], min(s['work_days'] - 1, 28)))
-                work_sample.sort()
-
-                for d_off in work_sample:
-                    day_d = now - timedelta(days=d_off)
-                    d_iso = day_d.strftime('%Y-%m-%d')
-                    sh, sm = s['shift_start']
-                    in_t = day_d.replace(hour=sh, minute=sm, second=random.randint(10, 50))
-                    in_iso = in_t.strftime('%Y-%m-%dT%H:%M:%S.000000')
-
-                    dur_m = int(s['shift_duration_hours'] * 60) + random.randint(-15, 20)
-                    out_t = in_t + timedelta(minutes=dur_m)
-                    out_iso = out_t.strftime('%Y-%m-%dT%H:%M:%S.000000')
-
-                    if d_off == 0:
-                        # Today
-                        if s['today_status'] == 'in_hospital':
-                            cur.execute("""
-                                INSERT OR REPLACE INTO daily_attendance (
-                                    employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
-                                    check_out_time, check_out_camera, check_out_camera_name,
-                                    duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
-                                ) VALUES (?, ?, ?, 'main', 'Main Porch Entry — Inbound', NULL, NULL, NULL, ?, 'in_hospital', 0, 8, 'main,recep1')
-                            """, (s['id'], d_iso, in_iso, int((now - in_t).total_seconds() / 60)))
-                            cur.execute("""
-                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted)
-                                VALUES (?, 'main', ?, ?, 0.98, NULL, 0)
-                            """, (s['id'], in_iso, s['gender']))
-                            cur.execute("""
-                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted)
-                                VALUES (?, 'recep1', ?, ?, 0.97, NULL, 0)
-                            """, (s['id'], (in_t + timedelta(minutes=45)).strftime('%Y-%m-%dT%H:%M:%S.000000'), s['gender']))
-                        else:
-                            cur.execute("""
-                                INSERT OR REPLACE INTO daily_attendance (
-                                    employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
-                                    check_out_time, check_out_camera, check_out_camera_name,
-                                    duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
-                                ) VALUES (?, ?, ?, 'main', 'Main Porch Entry — Inbound', ?, 'cam_cd9e9a', 'Main porch exit', ?, 'checked_out', 1, 14, 'main,recep1,cam_cd9e9a')
-                            """, (s['id'], d_iso, in_iso, out_iso, dur_m))
-                            cur.execute("""
-                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted)
-                                VALUES (?, 'main', ?, ?, 0.98, NULL, 0)
-                            """, (s['id'], in_iso, s['gender']))
-                            cur.execute("""
-                                INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted)
-                                VALUES (?, 'cam_cd9e9a', ?, ?, 0.99, NULL, 0)
-                            """, (s['id'], out_iso, s['gender']))
-                    else:
-                        cur.execute("""
-                            INSERT OR REPLACE INTO daily_attendance (
-                                employee_id, date, check_in_time, check_in_camera, check_in_camera_name,
-                                check_out_time, check_out_camera, check_out_camera_name,
-                                duration_minutes, status, is_checkout_verified, sightings_count, cameras_visited
-                            ) VALUES (?, ?, ?, 'main', 'Main Porch Entry — Inbound', ?, 'cam_cd9e9a', 'Main porch exit', ?, 'checked_out', 1, 12, 'main,recep1,cam_cd9e9a')
-                        """, (s['id'], d_iso, in_iso, out_iso, dur_m))
-                        cur.execute("""
-                            INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted)
-                            VALUES (?, 'main', ?, ?, 0.98, NULL, 0)
-                        """, (s['id'], in_iso, s['gender']))
-                        cur.execute("""
-                            INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted)
-                            VALUES (?, 'cam_cd9e9a', ?, ?, 0.99, NULL, 0)
-                        """, (s['id'], out_iso, s['gender']))
-
-            conn.commit()
-            conn.close()
-            print("[ATTENDANCE SEEDER] Seeded 8 Medanta staff members and 30-day attendance history successfully!")
-        except Exception as e:
-            print("[ATTENDANCE SEEDER ERROR]", e)
+        # Auto-seeder permanently disabled
+        return
 
     def enroll_employee(self, name: str, employee_id: str = None, department: str = 'Hospital Staff', designation: str = 'Staff Member', photo_b64: str = None, photos_b64: list = None, existing_id: str = None):
         # Support both single photo and multiple angle photos (min 2, max 6)
@@ -3056,7 +3095,6 @@ class FaceTrackerEngine:
                 prof['is_enrolled'] = 1
                 prof['department'] = department
                 prof['designation'] = designation
-                prof['last_seen'] = now_iso
                 if primary_photo:
                     prof['photo_b64'] = primary_photo
                     prof['crops'] = crops
@@ -3075,12 +3113,13 @@ class FaceTrackerEngine:
                     'age': 35,
                     'embedding': emb,
                     'embeddings': all_embs,
-                    'last_seen': now_iso,
-                    'last_seen_epoch': time.time(),
+                    'first_seen': None,
+                    'last_seen': None,
+                    'last_seen_epoch': 0,
                     'photo_b64': primary_photo,
                     'crops': crops,
                     'best_quality': 50.0,
-                    'last_camera': 'main',
+                    'last_camera': None,
                     'is_blacklisted': False,
                     'blacklist_reason': None
                 }
@@ -3094,8 +3133,8 @@ class FaceTrackerEngine:
             ("""
                 INSERT INTO unique_visitors (
                     id, emp_code, name, department, designation, is_enrolled, gender, gender_confidence, age,
-                    embedding_json, photo_b64, crops_json, first_seen, last_seen, last_camera, is_blacklisted, gender_locked, enrollment_date
-                ) VALUES (?, ?, ?, ?, ?, 1, 'male', 0.95, 35, ?, ?, ?, ?, ?, 'main', 0, 1, ?)
+                    embedding_json, photo_b64, crops_json, first_seen, last_seen, last_camera, is_blacklisted, gender_locked, enrollment_date, total_sightings
+                ) VALUES (?, ?, ?, ?, ?, 1, 'male', 0.95, 35, ?, ?, ?, NULL, NULL, NULL, 0, 1, ?, 0)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     department = excluded.department,
@@ -3104,9 +3143,8 @@ class FaceTrackerEngine:
                     photo_b64 = COALESCE(excluded.photo_b64, unique_visitors.photo_b64),
                     crops_json = CASE WHEN excluded.photo_b64 IS NOT NULL THEN excluded.crops_json ELSE unique_visitors.crops_json END,
                     embedding_json = CASE WHEN excluded.embedding_json IS NOT NULL THEN excluded.embedding_json ELSE unique_visitors.embedding_json END,
-                    enrollment_date = excluded.enrollment_date,
-                    last_seen = excluded.last_seen
-            """, (target_id, target_id, target_name, department, designation, emb_json, primary_photo, crops_json, now_iso, now_iso, now_iso))
+                    enrollment_date = excluded.enrollment_date
+            """, (target_id, target_id, target_name, department, designation, emb_json, primary_photo, crops_json, now_iso))
         ])
 
         clean_prof = {k: v for k, v in prof.items() if k not in ('embedding', 'embeddings')}
@@ -3142,20 +3180,35 @@ class FaceTrackerEngine:
         return cam_obj
 
     def remove_camera(self, camera_id: str):
-        if camera_id == 'main':
-            return False, "Cannot delete primary default camera"
+        if camera_id not in CAMERA_SOURCES:
+            return False, "Camera not found"
+        if len(CAMERA_SOURCES) <= 1:
+            return False, "Cannot delete camera: at least one camera must remain active"
+
+        cam_to_remove = CAMERA_SOURCES[camera_id]
+        if cam_to_remove.get('role') == 'entry':
+            other_entry_cams = [cid for cid, c in CAMERA_SOURCES.items() if cid != camera_id and c.get('role') == 'entry']
+            if not other_entry_cams:
+                return False, "Cannot delete camera: at least one camera with 'entry' role must remain active"
+
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         cur = conn.cursor()
         cur.execute('DELETE FROM cameras WHERE id = ?', (camera_id,))
         conn.commit()
         conn.close()
+
         if camera_id in self.pipelines:
             self.pipelines[camera_id].stop()
             del self.pipelines[camera_id]
+
         if camera_id in CAMERA_SOURCES:
             del CAMERA_SOURCES[camera_id]
+
         if self.active_camera == camera_id:
-            self.switch_camera('main')
+            next_cam = next(iter(CAMERA_SOURCES.keys()), None)
+            if next_cam:
+                self.switch_camera(next_cam)
+
         return True, "Camera removed successfully"
 
     def edit_camera(self, camera_id: str, name: str, location: str, rtsp: str, role: str = None):
@@ -3214,7 +3267,7 @@ class FaceTrackerEngine:
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         cur = conn.cursor()
         cur.execute('''
-            SELECT camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted, face_b64 
+            SELECT camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted, face_b64, last_seen, dwell_mins 
             FROM visitor_sightings 
             WHERE visitor_id = ? 
             ORDER BY timestamp ASC
@@ -3243,22 +3296,63 @@ class FaceTrackerEngine:
         for idx, r in enumerate(rows):
             cam_info = CAMERA_SOURCES.get(r[0], {})
             ts_str = r[1]
-            dwell_mins = 0
+            s_end_iso = r[7] if (len(r) > 7 and r[7]) else ts_str
+
+            # 1. Transit gap / Absence: time elapsed since previous checkpoint on the SAME day
+            transit_gap_mins = 0
+            is_first_of_day = False
             try:
                 curr_dt = datetime.fromisoformat(ts_str)
                 if prev_time:
-                    dwell_mins = max(1, int((curr_dt - prev_time).total_seconds() / 60))
+                    if curr_dt.date() != prev_time.date():
+                        is_first_of_day = True
+                        transit_gap_mins = 0
+                    else:
+                        transit_gap_mins = max(1, int((curr_dt - prev_time).total_seconds() / 60))
+                else:
+                    is_first_of_day = True
                 prev_time = curr_dt
             except Exception:
                 pass
+
+            # 2. Station Dwell Time: time spent directly in front of THIS camera
+            station_dwell_mins = 1
+            s_start_dt = None
+            s_end_dt = None
+            try:
+                s_start_dt = datetime.fromisoformat(ts_str)
+            except Exception:
+                pass
+            try:
+                s_end_dt = datetime.fromisoformat(s_end_iso)
+            except Exception:
+                s_end_dt = s_start_dt
+
+            if s_start_dt and s_end_dt:
+                station_dwell_mins = max(1, int((s_end_dt - s_start_dt).total_seconds() / 60))
+            elif len(r) > 8 and r[8]:
+                station_dwell_mins = max(1, int(r[8]))
+
+            if s_start_dt and s_end_dt and station_dwell_mins > 1:
+                t_disp = f"{s_start_dt.strftime('%I:%M %p')} – {s_end_dt.strftime('%I:%M %p')}"
+            elif s_start_dt:
+                t_disp = s_start_dt.strftime("%I:%M %p")
+            else:
+                t_disp = ts_str.replace('T', ' ').split('.')[0]
 
             cam_id_lower = str(r[0] or '').lower()
             cam_name_str = cam_info.get('name', r[0])
             cam_name_lower = str(cam_name_str).lower()
             cam_role = str(cam_info.get('role', '')).lower()
-            if cam_role == 'entry' or 'entry' in cam_id_lower or 'entry' in cam_name_lower or cam_id_lower in ('staff', 'main'):
+            if cam_role == 'entry':
                 ev_type = 'IN'
-            elif cam_role == 'exit' or 'exit' in cam_id_lower or 'exit' in cam_name_lower or 'outbound' in cam_name_lower or cam_id_lower in ('staff_exit', 'cam_cd9e9a'):
+            elif cam_role == 'exit':
+                ev_type = 'OUT'
+            elif cam_role in ('internal', 'perimeter', 'transit', 'ward'):
+                ev_type = 'TRANSIT'
+            elif 'entry' in cam_id_lower or 'entry' in cam_name_lower or cam_id_lower in ('staff', 'main'):
+                ev_type = 'IN'
+            elif 'exit' in cam_id_lower or 'exit' in cam_name_lower or 'outbound' in cam_name_lower or cam_id_lower in ('staff_exit', 'cam_cd9e9a'):
                 ev_type = 'OUT'
             else:
                 ev_type = 'TRANSIT'
@@ -3276,8 +3370,12 @@ class FaceTrackerEngine:
                 'camera_name': cam_name_str,
                 'location': cam_info.get('location', 'Hospital Zone'),
                 'timestamp': ts_str,
-                'time_display': ts_str.replace('T', ' ').split('.')[0],
-                'dwell_mins_since_prev': dwell_mins,
+                'end_timestamp': s_end_iso,
+                'time_display': t_disp,
+                'dwell_mins': station_dwell_mins,           # Actual station dwell at this camera
+                'dwell_mins_since_prev': transit_gap_mins,  # Transit gap from prev checkpoint
+                'transit_mins': transit_gap_mins,           # Dedicated transit gap field
+                'is_first_of_day': is_first_of_day,
                 'confidence': round(float(r[3] or 0.95) * 100, 1),
                 'face_b64': sighting_face,
                 'photo_b64': sighting_face or r[4],  # Direct face crop for thumbnail
@@ -3295,8 +3393,9 @@ class FaceTrackerEngine:
                 last_dt = datetime.fromisoformat(last_seen_str)
                 prev_cp_dt = datetime.fromisoformat(checkpoints[-1]['timestamp'])
                 diff_sec = (last_dt - prev_cp_dt).total_seconds()
-                if diff_sec > 30:
-                    last_face = crops_list[-1] if crops_list else None
+                if diff_sec > 30 and checkpoints[-1]['camera_id'] != last_cam_id:
+                    last_face = checkpoints[-1].get('face_b64') or (crops_list[-1] if crops_list else None)
+                    last_body = checkpoints[-1].get('body_b64') or vis_row[8]
                     checkpoints.append({
                         'camera_id': last_cam_id,
                         'camera_name': last_cam_info.get('name', last_cam_id),
@@ -3306,8 +3405,8 @@ class FaceTrackerEngine:
                         'dwell_mins_since_prev': max(1, int(diff_sec / 60)),
                         'confidence': 98.4,
                         'face_b64': last_face,
-                        'photo_b64': last_face or vis_row[8],
-                        'body_b64': vis_row[8],
+                        'photo_b64': last_face or last_body,
+                        'body_b64': last_body,
                         'is_blacklisted': bool(vis_row[7]),
                         'event_type': 'OUT' if ('exit' in str(last_cam_id).lower() or 'exit' in str(last_cam_info.get('name', '')).lower()) else 'IN'
                     })
@@ -3420,6 +3519,8 @@ class FaceTrackerEngine:
             today_out_count = today_rec.get('out_count', 1 if today_rec.get('is_checkout_verified') else 0)
             today_total_mov = today_rec.get('total_movements', today_in_count + today_out_count)
 
+        latest_cctv_crop = (checkpoints[-1].get('body_b64') or checkpoints[-1].get('photo_b64')) if checkpoints else None
+
         return {
             'visitor_id': vis_row[0],
             'employee_id': vis_row[0],
@@ -3439,7 +3540,7 @@ class FaceTrackerEngine:
             'last_camera': vis_row[5],
             'last_camera_name': last_cam_info.get('name', vis_row[5]),
             'is_blacklisted': bool(vis_row[7]),
-            'photo_b64': vis_row[8],
+            'photo_b64': latest_cctv_crop or vis_row[8],
             'crops': crops_list,
             'today_in_count': today_in_count,
             'today_out_count': today_out_count,
@@ -3697,6 +3798,27 @@ class FaceTrackerEngine:
 
         return pruned_count
 
+    def is_valid_face_crop(self, face_crop: np.ndarray) -> bool:
+        if face_crop is None or face_crop.size == 0:
+            return False
+        ih, iw = face_crop.shape[:2]
+        if iw < 32 or ih < 36:
+            return False
+        try:
+            with self.inference_lock:
+                self.detector.setInputSize((iw, ih))
+                _, faces = self.detector.detect(face_crop)
+            if faces is None or len(faces) == 0:
+                return False
+            f = faces[0]
+            det_score = float(f[-1])
+            if det_score < 0.65:
+                return False
+            is_sharp, _ = self._is_sharp_face_crop(face_crop, f, det_score)
+            return is_sharp
+        except Exception:
+            return False
+
     def is_valid_face_b64(self, photo_b64: str) -> bool:
         if not photo_b64:
             return False
@@ -3704,18 +3826,7 @@ class FaceTrackerEngine:
             raw = photo_b64.split(',', 1)[1] if ',' in photo_b64 else photo_b64
             img_bytes = base64.b64decode(raw)
             img = cv2.imdecode(np.frombuffer(img_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if img is None or img.size == 0:
-                return False
-            ih, iw = img.shape[:2]
-            if iw < 32 or ih < 36:
-                return False
-            with self.inference_lock:
-                self.detector.setInputSize((iw, ih))
-                _, faces = self.detector.detect(img)
-            if faces is None or len(faces) == 0:
-                return False
-            is_sharp, _ = self._is_sharp_face_crop(img, faces[0], float(faces[0][-1]))
-            return is_sharp
+            return self.is_valid_face_crop(img)
         except Exception:
             return False
 
@@ -4205,10 +4316,10 @@ class FaceTrackerEngine:
 
         return {
             'total_personnel': total_personnel,
-            'total_staff_present_today': staff_present_today or total_personnel,
+            'total_staff_present_today': staff_present_today,
             'present_percent': present_pct,
-            'currently_in_hospital': in_hospital_today or max(1, staff_present_today - checked_out_today),
-            'in_campus_now': in_hospital_today or max(1, staff_present_today - checked_out_today),
+            'currently_in_hospital': in_hospital_today,
+            'in_campus_now': in_hospital_today,
             'in_campus_percent': in_campus_pct,
             'checked_out_today': checked_out_today,
             'absent_today': absent_today,
@@ -4228,8 +4339,8 @@ class FaceTrackerEngine:
             'avg_movement_stops': avg_stops,
             'productivity_index': prod_index,
             'time_at_work_area': time_at_work_area,
-            'total_visitors_detected': staff_present_today or total_personnel,
-            'unique_visitors_verified': staff_present_today or total_personnel,
+            'total_visitors_detected': staff_present_today,
+            'unique_visitors_verified': staff_present_today,
             'male_visitors': male_cnt,
             'female_visitors': female_cnt,
             'watchlist_count': wl_cnt or 0,
@@ -4498,15 +4609,36 @@ class FaceTrackerEngine:
             if not crops and r[6]:
                 crops = [r[6]]
             is_locked = bool(r[10]) if len(r) > 10 and r[10] else False
-            cam_id = r[3] or 'main'
-            cam_obj = CAMERA_SOURCES.get(cam_id, {})
-            cam_name = cam_obj.get('name') or CAMERA_FALLBACKS.get(cam_id, cam_id)
-            location = cam_obj.get('location') or 'Gate 01 Main Entry'
+            sightings_cnt = r[8] or 0
+            
+            vis_id = r[0]
+            v_mem = self.unique_cache_by_id.get(vis_id, {})
 
-            first_seen = r[13] if len(r) > 13 and r[13] else r[2]
-            last_seen = r[2]
-            cam_cnt = r[14] if len(r) > 14 and r[14] else 1
-            cams_csv = r[15] if len(r) > 15 and r[15] else cam_id
+            # -------------------------------------------------------------
+            # LATEST SIGHTING DETECTION (Journey Last Sighting)
+            # Find the true latest detection across DB sightings and memory
+            # -------------------------------------------------------------
+            last_seen_ts = r[2] or v_mem.get('last_seen')
+            last_cam_id = r[3] or v_mem.get('last_camera')
+            try:
+                cur.execute("SELECT camera_id, coalesce(last_seen, timestamp) FROM visitor_sightings WHERE visitor_id = ? ORDER BY timestamp DESC LIMIT 1", (vis_id,))
+                latest_s = cur.fetchone()
+                if latest_s and latest_s[1]:
+                    last_cam_id = latest_s[0]
+                    last_seen_ts = latest_s[1]
+            except Exception:
+                pass
+
+            has_been_seen = bool(last_seen_ts and last_cam_id)
+            cam_id = last_cam_id if has_been_seen else None
+            cam_obj = CAMERA_SOURCES.get(cam_id, {}) if cam_id else {}
+            cam_name = cam_obj.get('name') or (CAMERA_FALLBACKS.get(cam_id, cam_id) if cam_id else '—')
+            location = cam_obj.get('location') or ('—' if not cam_id else 'Hospital Zone')
+
+            first_seen = r[13] if (len(r) > 13 and r[13] and has_been_seen) else (last_seen_ts if has_been_seen else None)
+            last_seen = last_seen_ts if has_been_seen else None
+            cam_cnt = r[14] if (len(r) > 14 and r[14] and has_been_seen) else (1 if has_been_seen else 0)
+            cams_csv = r[15] if (len(r) > 15 and r[15] and has_been_seen) else (cam_id or '')
             cams_list = [c.strip() for c in cams_csv.split(',') if c.strip()]
             
             cam_names = []
@@ -4516,17 +4648,20 @@ class FaceTrackerEngine:
                     cam_names.append(cn)
 
             dwell_mins = 0
-            try:
-                dt1 = datetime.fromisoformat(first_seen)
-                dt2 = datetime.fromisoformat(last_seen)
-                dwell_mins = max(1, int((dt2 - dt1).total_seconds() / 60))
-            except Exception:
-                dwell_mins = 1
+            if first_seen and last_seen:
+                try:
+                    dt1 = datetime.fromisoformat(first_seen)
+                    dt2 = datetime.fromisoformat(last_seen)
+                    dwell_mins = max(1, int((dt2 - dt1).total_seconds() / 60))
+                except Exception:
+                    dwell_mins = 1
 
             if dwell_mins >= 60:
                 dwell_str = f"{dwell_mins // 60}h {dwell_mins % 60}m"
-            else:
+            elif dwell_mins > 0:
                 dwell_str = f"{dwell_mins}m"
+            else:
+                dwell_str = "—"
 
             route_str = " ➔ ".join(cam_names) if len(cam_names) > 1 else cam_name
             is_multi = cam_cnt > 1
@@ -4538,8 +4673,6 @@ class FaceTrackerEngine:
             else:
                 verification_rate = 85.0
 
-            vis_id = r[0]
-            v_mem = self.unique_cache_by_id.get(vis_id, {})
             reg_name = v_mem.get('name')
             is_enrolled_staff = bool(v_mem.get('is_enrolled') or (reg_name and not reg_name.startswith('EMP-') and not reg_name.startswith('Target')))
             display_name = reg_name if is_enrolled_staff else vis_id
@@ -4549,46 +4682,54 @@ class FaceTrackerEngine:
             stats_30d = self.get_employee_30d_stats(vis_id)
 
             today_check_in = None
+            today_check_in_raw = None
             today_check_in_cam = None
             today_check_out = None
+            today_check_out_raw = None
             today_check_out_cam = None
             today_duration_mins = 0
-            today_status = 'IN HOSPITAL'
+            today_status = 'NOT CHECKED IN'
             is_checkout_verified = False
-
-            today_check_in_raw = None
-            today_check_out_raw = None
 
             if stats_30d and stats_30d.get('daily_records'):
                 first_rec = stats_30d['daily_records'][0]
                 today_str_check = get_ist_now().strftime('%Y-%m-%d')
                 if first_rec['date'] == today_str_check:
-                    today_check_in = first_rec['check_in_time']
-                    today_check_in_raw = first_rec['check_in_time']
-                    today_check_in_cam = first_rec['check_in_camera']
-                    today_check_out = first_rec['check_out_time']
-                    today_check_out_raw = first_rec['check_out_time']
-                    today_check_out_cam = first_rec['check_out_camera']
-                    today_duration_mins = first_rec['duration_minutes']
-                    today_status = 'CHECKED OUT' if first_rec['status'] == 'Checked Out' else 'IN HOSPITAL'
-                    is_checkout_verified = first_rec['is_checkout_verified']
+                    if first_rec.get('check_in_time'):
+                        today_check_in = first_rec['check_in_time']
+                        today_check_in_raw = first_rec['check_in_time']
+                        today_check_in_cam = first_rec.get('check_in_camera')
+                    if first_rec.get('check_out_time'):
+                        today_check_out = first_rec['check_out_time']
+                        today_check_out_raw = first_rec['check_out_time']
+                        today_check_out_cam = first_rec.get('check_out_camera')
+                    today_duration_mins = self.get_today_duty_minutes(vis_id, today_str_check)
+                    today_status = 'CHECKED OUT' if str(first_rec.get('status', '')).lower() in ('checked out', 'checked_out') else 'IN HOSPITAL'
+                    is_checkout_verified = bool(first_rec.get('is_checkout_verified'))
 
             if v_mem:
                 if v_mem.get('today_status') == 'checked_out':
                     today_status = 'CHECKED OUT'
                     is_checkout_verified = True
-                    if v_mem.get('today_check_out'):
-                        today_check_out = v_mem.get('today_check_out')
-                        today_check_out_raw = v_mem.get('today_check_out')
                 elif v_mem.get('today_status') == 'in_hospital':
                     today_status = 'IN HOSPITAL'
                     is_checkout_verified = False
+
+                if v_mem.get('today_check_in'):
+                    today_check_in = v_mem['today_check_in']
+                    today_check_in_raw = v_mem['today_check_in']
+                    today_check_in_cam = v_mem.get('today_check_in_camera')
+
+                if v_mem.get('today_check_out'):
+                    today_check_out = v_mem['today_check_out']
+                    today_check_out_raw = v_mem['today_check_out']
+                    today_check_out_cam = v_mem.get('today_check_out_camera')
 
             now_ist = get_ist_now()
             is_exit_last = bool(cam_id and ('exit' in str(cam_id).lower() or 'exit' in str(cam_name).lower()))
             is_absent = bool(today_check_in and (today_status == 'CHECKED OUT' or is_checkout_verified or is_exit_last))
             
-            exit_iso = today_check_out_raw or (last_seen if is_exit_last else None)
+            exit_iso = today_check_out_raw or (last_seen if (is_exit_last and has_been_seen) else None)
             missing_mins = 0
             missing_str = "—"
             if is_absent and exit_iso:
@@ -4604,22 +4745,25 @@ class FaceTrackerEngine:
                     missing_mins = 1
                     missing_str = "1m"
 
-            today_in_disp = today_check_in.split('T')[1][:5] if (today_check_in and 'T' in today_check_in) else '08:30'
-            try:
-                if today_check_in:
+            today_in_disp = None
+            if today_check_in:
+                try:
                     today_in_disp = datetime.fromisoformat(today_check_in).strftime("%I:%M %p")
-            except Exception:
-                pass
+                except Exception:
+                    today_in_disp = today_check_in.split('T')[1][:5] if 'T' in today_check_in else today_check_in
 
             today_out_disp = None
-            if exit_iso:
+            if today_check_out:
                 try:
-                    today_out_disp = datetime.fromisoformat(exit_iso).strftime("%I:%M %p")
+                    today_out_disp = datetime.fromisoformat(today_check_out).strftime("%I:%M %p")
                 except Exception:
-                    today_out_disp = exit_iso.split('T')[1][:5] if 'T' in exit_iso else exit_iso
+                    today_out_disp = today_check_out.split('T')[1][:5] if 'T' in today_check_out else today_check_out
 
             th, tm = divmod(today_duration_mins, 60)
-            today_dur_str = f"{th}h {tm:02d}m" if today_duration_mins > 0 else "< 15m"
+            if not today_check_in:
+                today_dur_str = "—"
+            else:
+                today_dur_str = f"{th}h {tm:02d}m" if today_duration_mins > 0 else "< 15m"
 
             rows.append({
                 'id': vis_id,
@@ -4638,6 +4782,7 @@ class FaceTrackerEngine:
                 'last_seen': last_seen,
                 'camera_id': cam_id,
                 'camera_name': cam_name,
+                'last_camera_name': cam_name,
                 'location': location,
                 'previous_camera': r[11] if len(r) > 11 else None,
                 'previous_camera_name': r[12] if len(r) > 12 else None,
@@ -4882,7 +5027,7 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
                     except queue.Empty:
                         self.wfile.write(b"event: ping\ndata: {}\n\n")
                         self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError, OSError):
                 pass
             finally:
                 if q in tracker.alert_queues:
@@ -5028,15 +5173,16 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
 
         if path == '/api/cameras/add':
             name = (body.get('name') or '').strip()
-            location = (body.get('location') or '').strip()
+            location = (body.get('location') or '').strip() or name
             rtsp = (body.get('rtsp') or '').strip()
+            role = (body.get('role') or '').strip() or 'entry'
             if not name or not rtsp:
                 return self.send_json(400, {'error': 'Camera name and RTSP stream URL are required'})
-            cam = tracker.add_camera(name, location or 'Checkpoint', rtsp)
+            cam = tracker.add_camera(name, location, rtsp, role=role)
             return self.send_json(200, {'success': True, 'camera': cam, 'camera_id': cam['id'], 'cameras': tracker.get_cameras()})
 
-        if path == '/api/cameras/remove':
-            camera_id = body.get('id') or body.get('camera_id')
+        if path in ('/api/cameras/remove', '/api/cameras/delete'):
+            camera_id = body.get('id') or body.get('camera_id') or body.get('stream')
             if not camera_id:
                 return self.send_json(400, {'error': 'Missing camera_id'})
             ok, msg = tracker.remove_camera(camera_id)
