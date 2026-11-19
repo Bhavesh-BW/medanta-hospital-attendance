@@ -2189,14 +2189,34 @@ class FaceTrackerEngine:
             desig = r[14] if len(r) > 14 and r[14] else 'Staff Member'
             enr = bool(r[15]) if len(r) > 15 and r[15] is not None else bool(r_name)
 
+            expected_dim = 512 if getattr(self, 'arcface_sess', None) is not None else 128
+            if emb is not None:
+                emb = emb.flatten()
+                if len(emb) != expected_dim:
+                    re_extracted = None
+                    for c_img in crops[:4]:
+                        c_emb = self._extract_crop_embedding(c_img)
+                        if c_emb is not None and len(c_emb.flatten()) == expected_dim:
+                            re_extracted = c_emb.flatten()
+                            break
+                    emb = re_extracted
+            elif crops:
+                for c_img in crops[:4]:
+                    c_emb = self._extract_crop_embedding(c_img)
+                    if c_emb is not None and len(c_emb.flatten()) == expected_dim:
+                        emb = c_emb.flatten()
+                        break
+
             if emb is not None:
                 vis_embeddings = [emb]
                 if is_blk or enr:
                     for c_img in crops[:8]:
                         c_emb = self._extract_crop_embedding(c_img)
                         if c_emb is not None:
-                            if not any(np.dot(c_emb, exist_e) > 0.99 for exist_e in vis_embeddings):
-                                vis_embeddings.append(c_emb)
+                            c_emb = c_emb.flatten()
+                            if len(c_emb) == expected_dim:
+                                if not any((exist_e.shape == c_emb.shape and np.dot(c_emb, exist_e) > 0.99) for exist_e in vis_embeddings):
+                                    vis_embeddings.append(c_emb)
 
                 vis_obj = {
                     'id': vis_id,
