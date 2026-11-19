@@ -196,13 +196,16 @@ def init_db():
             confidence REAL,
             photo_b64 TEXT,
             face_b64 TEXT,
+            last_seen TEXT,
+            dwell_mins INTEGER DEFAULT 1,
             is_blacklisted INTEGER DEFAULT 0
         )
     ''')
-    try:
-        cur.execute('ALTER TABLE visitor_sightings ADD COLUMN face_b64 TEXT')
-    except Exception:
-        pass
+    for col in [('face_b64', 'TEXT'), ('last_seen', 'TEXT'), ('dwell_mins', 'INTEGER DEFAULT 1')]:
+        try:
+            cur.execute(f'ALTER TABLE visitor_sightings ADD COLUMN {col[0]} {col[1]}')
+        except Exception:
+            pass
     cur.execute('''
         CREATE TABLE IF NOT EXISTS blacklist_watchlist (
             id TEXT PRIMARY KEY,
@@ -1176,6 +1179,7 @@ class CameraStreamPipeline:
                         matched_visitor['last_seen_epoch'] = now_epoch
 
                         # Broadcast transit event with 60s cooldown
+                        live_body_crop = get_photo_b64() or matched_visitor.get('photo_b64', '')
                         transit_event = {
                             'visitor_id': visitor_id,
                             'name': matched_visitor.get('name') or visitor_id,
@@ -1183,7 +1187,7 @@ class CameraStreamPipeline:
                             'from_camera': prev_cam_name,
                             'to_camera': curr_name,
                             'duration_mins': duration_mins,
-                            'photo_b64': photo_b64 or matched_visitor.get('photo_b64', ''),
+                            'photo_b64': live_body_crop,
                             'timestamp': get_ist_str("%I:%M:%S %p IST")
                         }
                         last_tr = self.engine.transit_cooldowns.get(visitor_id, 0)
@@ -1209,7 +1213,7 @@ class CameraStreamPipeline:
                             cur_s.execute("""
                                 INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, last_seen, dwell_mins, gender, confidence, photo_b64, face_b64, is_blacklisted)
                                 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-                            """, (visitor_id, self.camera_id, now_iso, now_iso, matched_visitor['gender'], det_score, matched_visitor.get('photo_b64', '') or get_photo_b64(), get_face_b64(), 1 if matched_visitor.get('is_blacklisted') else 0))
+                            """, (visitor_id, self.camera_id, now_iso, now_iso, matched_visitor['gender'], det_score, get_photo_b64() or matched_visitor.get('photo_b64', ''), get_face_b64(), 1 if matched_visitor.get('is_blacklisted') else 0))
                             new_s_id = cur_s.lastrowid
                             conn_s.commit()
                             conn_s.close()
@@ -1265,7 +1269,7 @@ class CameraStreamPipeline:
                             cur_s.execute("""
                                 INSERT INTO visitor_sightings (visitor_id, camera_id, timestamp, last_seen, dwell_mins, gender, confidence, photo_b64, face_b64, is_blacklisted)
                                 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-                            """, (visitor_id, self.camera_id, now_iso, now_iso, matched_visitor['gender'], det_score, matched_visitor.get('photo_b64', '') or get_photo_b64(), get_face_b64(), 1 if matched_visitor.get('is_blacklisted') else 0))
+                            """, (visitor_id, self.camera_id, now_iso, now_iso, matched_visitor['gender'], det_score, get_photo_b64() or matched_visitor.get('photo_b64', ''), get_face_b64(), 1 if matched_visitor.get('is_blacklisted') else 0))
                             new_s_id = cur_s.lastrowid
                             conn_s.commit()
                             conn_s.close()
@@ -1385,7 +1389,7 @@ class CameraStreamPipeline:
                 now_ep = time.time()
                 hist_key = (target_key, self.camera_id)
                 last_logged = self.engine.blacklist_sighting_history.get(hist_key, 0)
-                bl_photo = (matched_visitor.get('photo_b64') if matched_visitor else None) or get_photo_b64()
+                bl_photo = get_photo_b64() or (matched_visitor.get('photo_b64') if matched_visitor else None)
                 if (now_ep - last_logged) > 20.0:
                     self.engine.blacklist_sighting_history[hist_key] = now_ep
                     self.engine.async_db_execute("""
@@ -3286,13 +3290,26 @@ class FaceTrackerEngine:
     def get_visitor_journey(self, visitor_id: str):
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         cur = conn.cursor()
-        cur.execute('''
-            SELECT camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted, face_b64, last_seen, dwell_mins 
-            FROM visitor_sightings 
-            WHERE visitor_id = ? 
-            ORDER BY timestamp ASC
-        ''', (visitor_id,))
-        rows = cur.fetchall()
+        try:
+            cur.execute('''
+                SELECT camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted, face_b64, last_seen, dwell_mins 
+                FROM visitor_sightings 
+                WHERE visitor_id = ? 
+                ORDER BY timestamp ASC
+            ''', (visitor_id,))
+            rows = cur.fetchall()
+        except Exception:
+            try:
+                cur.execute('''
+                    SELECT camera_id, timestamp, gender, confidence, photo_b64, is_blacklisted, face_b64, timestamp, 1 
+                    FROM visitor_sightings 
+                    WHERE visitor_id = ? 
+                    ORDER BY timestamp ASC
+                ''', (visitor_id,))
+                rows = cur.fetchall()
+            except Exception as e:
+                print(f"[GET_VISITOR_JOURNEY DB READ ERROR]: {e}")
+                rows = []
 
         cur.execute('SELECT id, gender, age, first_seen, last_seen, last_camera, previous_camera, is_blacklisted, photo_b64, crops_json FROM unique_visitors WHERE id = ?', (visitor_id,))
         vis_row = cur.fetchone()
@@ -3385,6 +3402,10 @@ class FaceTrackerEngine:
             if not sighting_face and crops_list:
                 sighting_face = crops_list[min(idx, len(crops_list) - 1)]
 
+            raw_body = r[4] if len(r) > 4 else None
+            is_enrolled_sample = bool(raw_body and (raw_body == vis_row[8] or raw_body in crops_list))
+            sighting_body = None if is_enrolled_sample else raw_body
+
             checkpoints.append({
                 'camera_id': r[0],
                 'camera_name': cam_name_str,
@@ -3398,8 +3419,8 @@ class FaceTrackerEngine:
                 'is_first_of_day': is_first_of_day,
                 'confidence': round(float(r[3] or 0.95) * 100, 1),
                 'face_b64': sighting_face,
-                'photo_b64': sighting_face or r[4],  # Direct face crop for thumbnail
-                'body_b64': r[4],                    # Outfit/Torso crop
+                'photo_b64': sighting_face or sighting_body or vis_row[8],  # Direct face crop for thumbnail
+                'body_b64': sighting_body,                    # Outfit/Torso crop (real CCTV only)
                 'is_blacklisted': bool(r[5]),
                 'event_type': ev_type
             })
@@ -3539,7 +3560,11 @@ class FaceTrackerEngine:
             today_out_count = today_rec.get('out_count', 1 if today_rec.get('is_checkout_verified') else 0)
             today_total_mov = today_rec.get('total_movements', today_in_count + today_out_count)
 
-        latest_cctv_crop = (checkpoints[-1].get('body_b64') or checkpoints[-1].get('photo_b64')) if checkpoints else None
+        latest_cctv_crop = None
+        for cp in reversed(checkpoints):
+            if cp.get('body_b64'):
+                latest_cctv_crop = cp['body_b64']
+                break
 
         return {
             'visitor_id': vis_row[0],
@@ -3560,7 +3585,9 @@ class FaceTrackerEngine:
             'last_camera': vis_row[5],
             'last_camera_name': last_cam_info.get('name', vis_row[5]),
             'is_blacklisted': bool(vis_row[7]),
-            'photo_b64': latest_cctv_crop or vis_row[8],
+            'photo_b64': vis_row[8] or latest_cctv_crop,
+            'latest_torso_b64': latest_cctv_crop,
+            'torso_b64': latest_cctv_crop,
             'crops': crops_list,
             'today_in_count': today_in_count,
             'today_out_count': today_out_count,

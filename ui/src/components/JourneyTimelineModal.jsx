@@ -321,7 +321,7 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
   // Photo & multi-crops
   const crops = Array.isArray(journey?.crops) && journey.crops.length > 0 ? journey.crops : (journey?.photo_b64 ? [journey.photo_b64] : []);
   const activeCrop = crops[selectedCropIdx] || crops[0] || null;
-  const bodyPhoto = journey?.photo_b64 || activeCrop;
+  const bodyPhoto = journey?.latest_torso_b64 || journey?.torso_b64 || (journey?.photo_b64 && !crops.includes(journey.photo_b64) && journey.photo_b64 !== activeCrop ? journey.photo_b64 : null);
 
   return (
     <div style={{
@@ -1176,7 +1176,7 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onDel
                                       {/* 2. CCTV Torso / Outfit Capture */}
                                       {(() => {
                                         const bodyImg = cp.body_b64;
-                                        if (!bodyImg || bodyImg === cp.face_b64) return null;
+                                        if (!bodyImg || bodyImg === cp.face_b64 || (crops && crops.includes(bodyImg))) return null;
                                         const src = bodyImg.startsWith('data:') ? bodyImg : `data:image/jpeg;base64,${bodyImg}`;
                                         return (
                                           <div
